@@ -1,0 +1,74 @@
+<?php
+// Test worker: one object built before the loop, request data checked per request.
+final class App {
+    public int $served = 0;
+    public array $leak = [];
+}
+$app = new App();
+$bootedAt = microtime(true);
+echo "bootstrap output must not reach any client\n";
+
+while (phphub_handle_request()) {
+    $app->served++;
+    $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
+    switch ($path) {
+        case '/warn':
+            trigger_error('test warning from worker', E_USER_WARNING);
+            echo 'warned';
+            break;
+        case '/sleep':
+            usleep((int)($_GET['ms'] ?? 0) * 1000);
+            echo 'slept';
+            break;
+        case '/spin':
+            while (true) { }
+        case '/fatal':
+            undefined_function_call();
+            break;
+        case '/header':
+            header('X-Set-Once: yes');
+            setcookie('c1', 'v1');
+            echo 'header';
+            break;
+        case '/status':
+            http_response_code(201);
+            echo 'created';
+            break;
+        case '/big':
+            echo str_repeat('x', (int)($_GET['n'] ?? 3000000));
+            break;
+        case '/stream':
+            echo "part1\n"; flush(); usleep(200000); echo "part2\n";
+            break;
+        case '/upload':
+            $f = $_FILES['f'] ?? null;
+            echo json_encode(['name' => $f['name'] ?? null, 'size' => $f['size'] ?? null,
+                'tmp_exists' => $f ? file_exists($f['tmp_name']) : null, 'tmp' => $f['tmp_name'] ?? null,
+                'post' => $_POST]);
+            break;
+        default:
+            header('Content-Type: application/json');
+            echo json_encode([
+                'app_id' => spl_object_id($app),
+                'served' => $app->served,
+                'booted_at' => $bootedAt,
+                'get' => $_GET,
+                'post' => $_POST,
+                'cookie' => $_COOKIE,
+                'method' => $_SERVER['REQUEST_METHOD'],
+                'uri' => $_SERVER['REQUEST_URI'],
+                'script_name' => $_SERVER['SCRIPT_NAME'],
+                'remote_addr' => $_SERVER['REMOTE_ADDR'],
+                'xff' => $_SERVER['HTTP_X_FORWARDED_FOR'] ?? null,
+                'xfp' => $_SERVER['HTTP_X_FORWARDED_PROTO'] ?? null,
+                'xri' => $_SERVER['HTTP_X_REAL_IP'] ?? null,
+                'body' => file_get_contents('php://input'),
+                'sapi' => PHP_SAPI,
+                'phalcon' => extension_loaded('phalcon'),
+                'opcache' => function_exists('opcache_get_status') && (opcache_get_status(false)['opcache_enabled'] ?? false),
+                'zts' => PHP_ZTS,
+                'thread_id' => getmypid(),
+            ]);
+    }
+    phphub_finish_request();
+}

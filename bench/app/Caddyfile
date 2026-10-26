@@ -1,0 +1,18 @@
+{
+	auto_https off
+	admin off
+	frankenphp {
+		num_threads {$THREADS:2}
+		worker {
+			file /var/www/html/public/franken.php
+			num {$THREADS:2}
+		}
+	}
+}
+
+:80 {
+	root * /var/www/html/public
+	php_server {
+		index franken.php
+	}
+}

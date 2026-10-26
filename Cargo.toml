@@ -1,0 +1,27 @@
+[package]
+name = "phphub"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "PHP application server: HTTP/1.1 and embedded ZTS PHP workers in one process"
+license = "MIT"
+publish = false
+
+[dependencies]
+bytes = "1"
+crossbeam-channel = "0.5"
+httparse = "1"
+httpdate = "1"
+libc = "0.2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "signal", "sync", "macros"] }
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = true
