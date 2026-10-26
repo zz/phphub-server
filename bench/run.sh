@@ -4,6 +4,8 @@
 #
 #   ./bench/run.sh            # 1 CPU, 2 PHP threads
 #   CPUS=0.2 ./bench/run.sh   # lab setting
+#   MODE=file ./bench/run.sh  # PHPHUB_MODE=file vs FrankenPHP php_server without worker
+#   MODE=index ./bench/run.sh # PHPHUB_MODE=index vs the same FrankenPHP setup
 set -eu
 cd "$(dirname "$0")"
 CPUS="${CPUS:-1}"
@@ -12,8 +14,16 @@ THREADS="${THREADS:-2}"
 CONNS="${CONNS:-16}"
 DURATION="${DURATION:-15s}"
 ROUNDS="${ROUNDS:-2}"
+MODE="${MODE:-worker}"
+case "$MODE" in
+worker) PHPHUB_ENV="-e WORKER_SCRIPT=phphub.php"; CADDYFILE=Caddyfile ;;
+index|file) PHPHUB_ENV="-e PHPHUB_MODE=$MODE -e WORKER_SCRIPT=index.php"; CADDYFILE=Caddyfile.classic ;;
+*) echo "MODE must be worker, index or file" >&2; exit 2 ;;
+esac
 # Fixed-rate run for latency at equal load (requests/s across all connections).
 RATE="${RATE:-4000}"
+# /plain.php is a one-line PHP file: file mode runs it, the others run the entry.
+PATHS="${PATHS:-/ /item/7?q=abc /hello /app.css /plain.php}"
 FRANKEN_IMAGE="${FRANKEN_IMAGE:-zhuzhu/php:8.5-phalcon-5.23-frankenphp}"
 PHPHUB_IMAGE="${PHPHUB_IMAGE:-phphub:dev}"
 # Copy the app into a volume inside the Docker VM. A bind mount from the
@@ -27,16 +37,16 @@ docker network create phbench >/dev/null 2>&1 || true
 docker rm -f b-phphub b-franken b-client >/dev/null 2>&1 || true
 docker run -d --name b-phphub --network phbench --cpus="$CPUS" --memory="$MEM" \
     -v "$APP":/var/www/html:ro -e SERVER_ROOT=/var/www/html/public \
-    -e WORKER_SCRIPT=phphub.php -e WORKERS="$THREADS" -e MAX_REQUESTS=0 "$PHPHUB_IMAGE" >/dev/null
+    $PHPHUB_ENV -e WORKERS="$THREADS" -e MAX_REQUESTS=0 "$PHPHUB_IMAGE" >/dev/null
 docker run -d --name b-franken --network phbench --cpus="$CPUS" --memory="$MEM" \
     -v "$APP":/var/www/html:ro  \
-    -e THREADS="$THREADS" "$FRANKEN_IMAGE" frankenphp run --config /var/www/html/Caddyfile >/dev/null
+    -e THREADS="$THREADS" "$FRANKEN_IMAGE" frankenphp run --config "/var/www/html/$CADDYFILE" >/dev/null
 docker run -d --name b-client --network phbench alpine:3.24 sleep infinity >/dev/null
 docker exec b-client apk add --no-cache wrk hey curl >/dev/null
 sleep 3
 
-echo "cpus=$CPUS mem=$MEM php_threads=$THREADS connections=$CONNS duration=$DURATION"
-for path in / /item/7?q=abc /hello /app.css; do
+echo "mode=$MODE cpus=$CPUS mem=$MEM php_threads=$THREADS connections=$CONNS duration=$DURATION"
+for path in $PATHS; do
     for host in b-phphub b-franken; do
         docker exec b-client wrk -t1 -c"$CONNS" -d3s "http://$host$path" >/dev/null # warm up
     done
@@ -53,7 +63,7 @@ for path in / /item/7?q=abc /hello /app.css; do
 done
 echo "--- latency at a fixed $RATE req/s (hey, $CONNS connections)"
 per=$((RATE / CONNS))
-for path in / /item/7?q=abc /hello /app.css; do
+for path in $PATHS; do
     for host in b-phphub b-franken; do
         out=$(docker exec b-client hey -z "$DURATION" -c "$CONNS" -q "$per" "http://$host$path")
         rps=$(echo "$out" | awk '/Requests\/sec/ {print $2}')

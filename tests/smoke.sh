@@ -14,7 +14,7 @@ fail() { printf 'FAIL  %s\n' "$1"; fails=$((fails + 1)); }
 check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (got '$2', want '$3')"; fi; }
 
 cleanup() {
-    docker rm -f s-worker s-slow s-classic s-client >/dev/null 2>&1
+    docker rm -f s-worker s-slow s-classic s-client s-mworker s-mworker-classic s-index s-file s-fpm >/dev/null 2>&1
     docker volume rm -f phphub-smoke-app >/dev/null 2>&1
     docker network rm $NET >/dev/null 2>&1
 }
@@ -25,7 +25,8 @@ docker network create $NET >/dev/null
 docker volume create phphub-smoke-app >/dev/null
 # .git cannot live in this repo, so the fixture is made here.
 docker run --rm -v "$PWD/app":/src:ro -v phphub-smoke-app:/dst alpine:3.24 \
-    sh -c 'cp -a /src/. /dst/ && mkdir -p /dst/public/.git && echo "[core]" > /dst/public/.git/config'
+    sh -c 'cp -a /src/. /dst/ && mkdir -p /dst/public/.git && echo "[core]" > /dst/public/.git/config &&
+        ln -s /var/www/html/outside.php /dst/public/link.php'
 
 run() {
     name=$1; shift
@@ -35,13 +36,22 @@ run() {
 run s-worker -e WORKERS=2 -e PHP_TIMEOUT=3 -e MAX_REQUESTS=50
 run s-slow -e WORKERS=2 -e SLOWLOG=1
 run s-classic -e WORKERS=2 -e WORKER_SCRIPT=classic.php
+run s-mworker -e WORKERS=2 -e PHPHUB_MODE=worker
+run s-mworker-classic -e WORKERS=2 -e PHPHUB_MODE=' Worker ' -e WORKER_SCRIPT=classic.php
+run s-index -e WORKERS=2 -e PHPHUB_MODE=index
+run s-file -e WORKERS=2 -e PHPHUB_MODE=file -e WORKER_SCRIPT=classic.php
+run s-fpm -e PHPHUB_MODE=fpm
 docker run -d --name s-client --network $NET alpine:3.24 sleep infinity >/dev/null
 docker exec s-client apk add --no-cache curl >/dev/null
 c() { docker exec s-client curl -s "$@"; }
 code() { docker exec s-client curl -s -o /dev/null -w '%{http_code}' "$@"; }
 
 for _ in $(seq 1 50); do
-    [ "$(code http://s-worker:9100/health)" = 200 ] && [ "$(code http://s-classic:9100/health)" = 200 ] && break
+    ok=1
+    for h in s-worker s-classic s-mworker s-index s-file; do
+        [ "$(code http://$h:9100/health)" = 200 ] || ok=0
+    done
+    [ $ok = 1 ] && break
     sleep 0.2
 done
 
@@ -119,6 +129,64 @@ echo "== classic front controller"
 check "classic script runs per request" "$(c 'http://s-classic/?a=1' | grep -c '"classic":true,"counter":1')" 1
 check "classic again starts fresh" "$(c 'http://s-classic/?a=2' | grep -c '"counter":1')" 1
 check "classic metrics label" "$(c http://s-classic:9100/metrics | grep -c 'worker="classic"')" 8
+
+echo "== PHPHUB_MODE unset"
+check "auto: entry is SCRIPT_FILENAME for /info3.php" "$(c http://s-worker/info3.php | grep -c '"script_filename":"\\/var\\/www\\/html\\/public\\/index.php"')" 1
+check "auto: classic entry for /info3.php" "$(c http://s-classic/info3.php | grep -c '"classic":true')" 1
+
+echo "== PHPHUB_MODE=worker"
+boots=$(for i in $(seq 1 30); do c http://s-mworker/; echo; done | sed 's/.*"booted_at":\([0-9.]*\).*/\1/' | sort -u | wc -l | tr -d ' ')
+check "worker: app object kept (2 threads -> 2 boots)" "$boots" 2
+check "worker: /info3.php runs the entry" "$(c http://s-mworker/info3.php | grep -c '"info3"')" 0
+check "worker: SCRIPT_NAME is the entry" "$(c http://s-mworker/info3.php | grep -c '"script_name":"\\/index.php"')" 1
+check "worker without loop: still answers" "$(code 'http://s-mworker-classic/?a=1')" 200
+check "worker without loop: runs per request" "$(c 'http://s-mworker-classic/?a=2' | grep -c '"counter":1')" 1
+sleep 0.2
+check "worker without loop: error logged" "$(docker logs s-mworker-classic 2>&1 | grep -c 'returned without calling phphub_handle_request() (PHPHUB_MODE=worker)')" 2
+check "worker without loop: process keeps running" "$(docker inspect s-mworker-classic --format '{{.State.Running}}')" true
+
+echo "== PHPHUB_MODE=index"
+r1=$(c 'http://s-index/?a=1'); r2=$(c 'http://s-index/?a=2')
+check "index: loop script served once per run" "$(echo "$r1$r2" | grep -o '"served":1' | wc -l | tr -d ' ')" 2
+b1=$(echo "$r1" | sed 's/.*"booted_at":\([0-9.]*\).*/\1/'); b2=$(echo "$r2" | sed 's/.*"booted_at":\([0-9.]*\).*/\1/')
+check "index: entry re-runs per request" "$([ "$b1" != "$b2" ] && echo yes)" yes
+check "index: /info3.php body comes from the entry" "$(c http://s-index/info3.php | grep -c '"info3"')" 0
+check "index: SCRIPT_FILENAME is the entry" "$(c http://s-index/info3.php | grep -c '"script_filename":"\\/var\\/www\\/html\\/public\\/index.php"')" 1
+check "index: no _url in GET" "$(c 'http://s-index/x/y?b=1' | grep -c '"get":{"b":"1"}')" 1
+check "index: metrics label is classic" "$(c http://s-index:9100/metrics | grep -c 'worker="/var/www/html/public/index.php"')" 0
+check "index: never upgraded to worker" "$(docker logs s-index 2>&1 | grep -c 'worker mode')" 0
+
+echo "== PHPHUB_MODE=file"
+f=$(c 'http://s-file/info3.php?q=1')
+check "file: /info3.php runs info3.php" "$(echo "$f" | grep -c '"info3":true')" 1
+check "file: SCRIPT_FILENAME is info3.php" "$(echo "$f" | grep -c '"script_filename":"\\/var\\/www\\/html\\/public\\/info3.php"')" 1
+check "file: SCRIPT_NAME" "$(echo "$f" | grep -c '"script_name":"\\/info3.php"')" 1
+check "file: REQUEST_URI is the client URI" "$(echo "$f" | grep -c '"request_uri":"\\/info3.php?q=1"')" 1
+check "file: QUERY_STRING untouched" "$(echo "$f" | grep -c '"query_string":"q=1","get":{"q":"1"}')" 1
+check "file: PATH_INFO empty" "$(echo "$f" | grep -c '"path_info":""')" 1
+p=$(c 'http://s-file/info3.php/extra/x')
+check "file: PATH_INFO split" "$(echo "$p" | grep -c '"script_name":"\\/info3.php","php_self":"\\/info3.php\\/extra\\/x","document_uri":"\\/info3.php","path_info":"\\/extra\\/x"')" 1
+check "file: / runs the entry" "$(c http://s-file/ | grep -c '"classic":true')" 1
+check "file: pretty URL runs the entry" "$(c http://s-file/album/123 | grep -c '"classic":true')" 1
+check "file: missing .php runs the entry" "$(c http://s-file/nope.php | grep -c '"classic":true')" 1
+check "file: missing .php is not a 404" "$(code http://s-file/nope.php)" 200
+check "file: dir without index.html runs the entry" "$(c http://s-file/sub2/ | grep -c '"classic":true')" 1
+check "file: style.css is static" "$(c http://s-file/style.css)" "body { color: red }"
+check "file: /.env is 403" "$(code http://s-file/.env)" 403
+check "file: /.env body empty" "$(c http://s-file/.env | wc -c | tr -d ' ')" 0
+check "file: symlink outside root does not run" "$(c http://s-file/link.php | grep -c 'outside the document root')" 0
+check "file: symlink outside root falls to entry" "$(c http://s-file/link.php | grep -c '"classic":true')" 1
+check "file: fatal in the picked file is 500" "$(code http://s-file/fatal.php)" 500
+check "file: entry still 200 after a fatal" "$(code http://s-file/)" 200
+check "file: .php source never sent" "$(c http://s-file/info3.php | grep -c '<?php')" 0
+check "file: metrics label is classic" "$(c http://s-file:9100/metrics | grep -c 'info3')" 0
+
+echo "== PHPHUB_MODE=fpm"
+sleep 0.5
+check "fpm: process exited" "$(docker inspect s-fpm --format '{{.State.Running}}')" false
+check "fpm: non-zero exit" "$(docker inspect s-fpm --format '{{.State.ExitCode}}' | grep -vc '^0$')" 1
+check "fpm: error line" "$(docker logs s-fpm 2>&1 | grep -c 'PHPHUB_MODE must be worker, index, or file')" 1
+check "fpm: did not listen" "$(docker logs s-fpm 2>&1 | grep -c 'listening')" 0
 
 echo "== graceful stop"
 docker exec -d s-client sh -c 'curl -s -o /dev/null -w "%{http_code}" "http://s-slow/sleep?ms=1500" > /tmp/drain'

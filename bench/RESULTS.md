@@ -75,3 +75,41 @@ Fixed 600 req/s (hey), all responses 200:
   the same test gives 73,900 req/s on `/hello` with p99 0.73 ms. FrankenPHP
   never reached its quota at 1 CPU (0 s throttled), so it never hit this.
   At 0.2 CPU both are throttled and both p99s land around 80–90 ms.
+
+## PHPHUB_MODE (2026-10-26, after the modes change)
+
+Same setup, 1 CPU, 512 MiB, 2 PHP threads, one 10 s round. `/plain.php` is a
+one-line PHP file. Rows marked `wrk timeout 16` in the raw output are the
+16 requests still open when wrk stops; they showed up on both servers and
+never as read or write errors.
+
+### worker vs FrankenPHP worker
+
+No change from before the modes work.
+
+| Route | PHPHub req/s | FrankenPHP req/s | at 4,000 req/s PHPHub p50 / p99 | FrankenPHP p50 / p99 |
+|---|---:|---:|---:|---:|
+| `/` | 27,844 | 8,770 | 0.5 / 1.1 ms | 1.3 / 3.3 ms |
+| `/item/7` | 32,697 | 9,686 | 0.4 / 1.0 ms | 1.1 / 3.1 ms |
+| `/hello` | 46,226 | 10,986 | 0.3 / 0.9 ms | 1.0 / 2.7 ms |
+| `/app.css` | 127,143 | 26,071 | 0.2 / 0.5 ms | 0.5 / 1.5 ms |
+| `/plain.php` | 41,643 | 11,117 | 0.4 / 0.8 ms | 1.0 / 2.5 ms |
+
+### file and index vs FrankenPHP `php_server` without a worker
+
+The entry is an unmodified front controller (`public/index.php`) that builds
+the Phalcon app on every request. FrankenPHP has no index mode; its
+`php_server` behaves like file mode in both tables (it runs `/plain.php`).
+
+| Route | file req/s | index req/s | FrankenPHP req/s | at 1,000 req/s file p50 / p99 | index p50 / p99 | FrankenPHP p50 / p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| `/` | 10,242 | 10,069 | 5,902 | 1.3 / 3.0 ms | 1.3 / 3.1 ms | 2.6 / 5.2 ms |
+| `/item/7` | 9,945 | 10,184 | 6,304 | 1.3 / 3.4 ms | 1.6 / 4.0 ms | 2.6 / 5.2 ms |
+| `/hello` | 12,330 | 12,352 | 6,871 | 1.5 / 3.8 ms | 1.2 / 2.5 ms | 2.4 / 5.4 ms |
+| `/app.css` | 126,808 | 120,339 | 25,915 | 0.5 / 2.3 ms | 0.2 / 0.8 ms | 0.9 / 3.6 ms |
+| `/plain.php` | 49,707 | 12,293 (entry) | 11,458 | 0.8 / 3.2 ms | 1.1 / 2.4 ms | 1.8 / 4.1 ms |
+
+Rebuilding the app per request drops throughput to about a third of the
+worker loop (10k vs 28k req/s on `/`), which is why benchmarks use the loop.
+Closed-loop p99 for PHPHub is again the 1-CPU quota throttling described
+above; FrankenPHP never reaches its quota.

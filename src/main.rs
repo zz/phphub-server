@@ -111,9 +111,10 @@ async fn serve(cfg: &'static Config, pool: &'static Pool) -> bool {
         }
     };
     logln!(
-        "listening on :{} (metrics :{}), {} PHP threads, root={}, script={}",
+        "listening on :{} (metrics :{}), mode={}, {} PHP threads, root={}, script={}",
         cfg.listen_port,
         cfg.metrics_port,
+        cfg.mode.name(),
         cfg.workers,
         cfg.server_root,
         cfg.worker_script

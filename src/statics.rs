@@ -15,19 +15,46 @@ pub enum Lookup {
     File(PathBuf, Metadata),
     /// A directory with index.html, asked for without the trailing slash.
     AddSlash,
+    /// Run the entry script.
     Php,
+    /// File mode: run this PHP file under the document root.
+    PhpFile(PhpFile),
+}
+
+pub struct PhpFile {
+    /// Absolute path, as asked for (not the symlink target).
+    pub filename: Vec<u8>,
+    /// Site path of the script, e.g. `/info3.php`.
+    pub name: Vec<u8>,
+    /// What follows the script in the path, e.g. `/extra`; may be empty.
+    pub path_info: Vec<u8>,
 }
 
 /// `decoded` is the percent-decoded path; dot segments were rejected earlier.
-pub fn lookup(root: &str, decoded: &[u8]) -> Lookup {
+/// `file_mode` lets existing PHP files under the root be picked as the script;
+/// `real_root` is the root with symlinks resolved, when known.
+pub fn lookup(root: &str, decoded: &[u8], file_mode: bool, real_root: Option<&Path>) -> Lookup {
     let mut full = Vec::with_capacity(root.len() + decoded.len() + 12);
     full.extend_from_slice(root.as_bytes());
     full.extend_from_slice(decoded);
     let path = Path::new(OsStr::from_bytes(&full));
 
-    let Ok(meta) = std::fs::metadata(path) else { return Lookup::Php };
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => {
+            if file_mode {
+                if let Some(f) = split_path_info(root, decoded, real_root) {
+                    return Lookup::PhpFile(f);
+                }
+            }
+            return Lookup::Php;
+        }
+    };
     if meta.is_file() {
         if is_php(decoded) {
+            if file_mode && inside_root(path, root, real_root) {
+                return Lookup::PhpFile(PhpFile { filename: full, name: decoded.to_vec(), path_info: Vec::new() });
+            }
             return Lookup::Php;
         }
         return Lookup::File(path.to_path_buf(), meta);
@@ -44,6 +71,47 @@ pub fn lookup(root: &str, decoded: &[u8]) -> Lookup {
         }
     }
     Lookup::Php
+}
+
+/// `/info3.php/extra` where `/info3.php` is a file: script plus PATH_INFO.
+/// Only tried when the full path does not exist, and only at segments that
+/// end in a PHP extension, so pretty URLs cost no extra stat.
+fn split_path_info(root: &str, decoded: &[u8], real_root: Option<&Path>) -> Option<PhpFile> {
+    let mut seg_start = 1;
+    for (i, &b) in decoded.iter().enumerate().skip(1) {
+        if b != b'/' {
+            continue;
+        }
+        let seg = &decoded[seg_start..i];
+        seg_start = i + 1;
+        if !is_php(seg) {
+            continue;
+        }
+        let mut full = Vec::with_capacity(root.len() + i);
+        full.extend_from_slice(root.as_bytes());
+        full.extend_from_slice(&decoded[..i]);
+        let path = Path::new(OsStr::from_bytes(&full));
+        match std::fs::metadata(path) {
+            Ok(m) if m.is_file() => {
+                if !inside_root(path, root, real_root) {
+                    return None;
+                }
+                return Some(PhpFile { name: decoded[..i].to_vec(), path_info: decoded[i..].to_vec(), filename: full });
+            }
+            Ok(m) if m.is_dir() => continue,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The real path, symlinks resolved, must stay under the document root.
+fn inside_root(path: &Path, root: &str, real_root: Option<&Path>) -> bool {
+    let Ok(real) = std::fs::canonicalize(path) else { return false };
+    match real_root {
+        Some(r) => real.starts_with(r),
+        None => std::fs::canonicalize(root).is_ok_and(|r| real.starts_with(r)),
+    }
 }
 
 /// PHP source is never sent as a file.
@@ -311,6 +379,45 @@ mod tests {
         assert!(is_php(b"/x.phtml"));
         assert!(!is_php(b"/style.css"));
         assert!(!is_php(b"/php"));
+    }
+
+    #[test]
+    fn file_mode_lookup() {
+        let dir = std::env::temp_dir().join(format!("phphub-lookup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("root");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("info3.php"), "<?php").unwrap();
+        std::fs::write(root.join("sub/a.php"), "<?php").unwrap();
+        std::fs::write(root.join("style.css"), "x").unwrap();
+        std::fs::write(dir.join("outside.php"), "<?php").unwrap();
+        std::os::unix::fs::symlink(dir.join("outside.php"), root.join("link.php")).unwrap();
+        let r = root.to_str().unwrap();
+        let real = std::fs::canonicalize(&root).unwrap();
+        let rr = Some(real.as_path());
+
+        match lookup(r, b"/info3.php", true, rr) {
+            Lookup::PhpFile(f) => {
+                assert_eq!(f.name, b"/info3.php");
+                assert!(f.path_info.is_empty());
+                assert!(f.filename.ends_with(b"/root/info3.php"));
+            }
+            _ => panic!("info3.php should run"),
+        }
+        match lookup(r, b"/sub/a.php/x/y", true, rr) {
+            Lookup::PhpFile(f) => {
+                assert_eq!(f.name, b"/sub/a.php");
+                assert_eq!(f.path_info, b"/x/y");
+            }
+            _ => panic!("PATH_INFO split"),
+        }
+        assert!(matches!(lookup(r, b"/info3.php", false, rr), Lookup::Php));
+        assert!(matches!(lookup(r, b"/missing.php", true, rr), Lookup::Php));
+        assert!(matches!(lookup(r, b"/album/123", true, rr), Lookup::Php));
+        assert!(matches!(lookup(r, b"/sub/", true, rr), Lookup::Php));
+        assert!(matches!(lookup(r, b"/link.php", true, rr), Lookup::Php));
+        assert!(matches!(lookup(r, b"/style.css", true, rr), Lookup::File(..)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

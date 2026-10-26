@@ -25,6 +25,7 @@ pub struct HubRequest {
     pub num_vars: usize,
     pub request_time: f64,
     pub proto_num: c_int,
+    pub script: *const c_char,
 }
 
 pub const RUN_FATAL: c_int = 1;
@@ -42,6 +43,6 @@ unsafe extern "C" {
     pub fn phphub_php_shutdown();
     pub fn phphub_thread_init(rs: *mut c_void, script: *const c_char) -> *mut c_void;
     pub fn phphub_thread_free(ctx: *mut c_void);
-    pub fn phphub_run(ctx: *mut c_void, req: *const HubRequest) -> c_int;
+    pub fn phphub_run(ctx: *mut c_void, req: *const HubRequest, once: c_int) -> c_int;
     pub fn phphub_kick(ctx: *mut c_void, seq: u64);
 }

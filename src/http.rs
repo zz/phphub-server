@@ -360,7 +360,9 @@ async fn route(
         return simple(stream, 403, minor, keepalive, is_head).await.ok().map(|_| keepalive);
     }
 
-    match statics::lookup(&srv.cfg.server_root, &decoded) {
+    let file_mode = srv.cfg.mode == crate::config::RunMode::File;
+    let mut script = job::Script::Entry { path_info: file_mode };
+    match statics::lookup(&srv.cfg.server_root, &decoded, file_mode, srv.cfg.server_root_real.as_deref()) {
         statics::Lookup::File(path, meta) => {
             let m = req.method();
             if m != b"GET" && m != b"HEAD" {
@@ -383,9 +385,14 @@ async fn route(
             return r.ok().map(|_| keepalive);
         }
         statics::Lookup::Php => {}
+        statics::Lookup::PhpFile(f) => script = job::Script::File(f),
     }
 
     // PHP.
+    let script_log: Option<String> = match &script {
+        job::Script::File(f) => Some(String::from_utf8_lossy(&f.filename).into_owned()),
+        job::Script::Entry { .. } => None,
+    };
     let seq = srv.pool.next_seq();
     let (tx, rx) = oneshot::channel();
     let parts = job::Parts {
@@ -399,6 +406,7 @@ async fn route(
         body,
         remote,
         local,
+        script,
     };
     let job = job::build(parts, srv.cfg, seq, tx, received);
     let shared = job.shared.clone();
@@ -411,7 +419,7 @@ async fn route(
             return simple(stream, 502, minor, false, is_head).await.ok().map(|_| false);
         }
         Err(_) => {
-            timed_out(srv, &req, &shared, seq, received);
+            timed_out(srv, &req, &shared, seq, received, script_log.as_deref());
             return simple(stream, 504, minor, false, is_head).await.ok().map(|_| false);
         }
     };
@@ -465,7 +473,7 @@ async fn route(
                     }
                     Ok(None) => break,
                     Err(_) => {
-                        timed_out(srv, &req, &shared, seq, received);
+                        timed_out(srv, &req, &shared, seq, received, script_log.as_deref());
                         return None;
                     }
                 }
@@ -478,7 +486,7 @@ async fn route(
     }
 }
 
-fn timed_out(srv: &Server, req: &Req, shared: &job::JobShared, seq: u64, received: Instant) {
+fn timed_out(srv: &Server, req: &Req, shared: &job::JobShared, seq: u64, received: Instant, script: Option<&str>) {
     let thread = srv.pool.abandon(shared, seq);
     let path = String::from_utf8_lossy(&req.head[req.target.clone()]);
     let path = path.split('?').next().unwrap_or("");
@@ -490,7 +498,7 @@ fn timed_out(srv: &Server, req: &Req, shared: &job::JobShared, seq: u64, receive
     logln!(
         "request timed out (PHP_TIMEOUT={}s) in {where_}: method={method} path={path} script={} time={:.3}s",
         srv.cfg.php_timeout.as_secs(),
-        srv.pool.script(),
+        script.unwrap_or(srv.pool.script()),
         received.elapsed().as_secs_f64()
     );
 }

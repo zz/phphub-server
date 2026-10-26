@@ -121,8 +121,11 @@ opcache 打开。`validate_timestamps=1`，`revalidate_freq=2`，这样 BaseHub 
 | 指标 | `METRICS_PORT`，默认 `9100`。`/metrics` 和 `/health` 由 Rust 回答，不进 PHP。进程的指标端口填同一个数。 |
 | 健康检查 | 容器内 `http://127.0.0.1:$METRICS_PORT/health`。至少一条工作线程能接请求才是 200，否则 503。不再使用 2019。 |
 | 日志 | 访问日志不打。错误日志默认开，慢日志默认关。都写到标准错误，不写文件。 |
+| 模式 | `PHPHUB_MODE`：`worker`、`index`、`file`。空着保持现在的自动判断。规格在 [modes.md](modes.md)。 |
 
 停容器时先不接受新连接，等在途请求到 `PHP_TIMEOUT`，再让循环里的 `phphub_handle_request()` 返回 `false`。
+
+BaseHub 按进程写入 `PHPHUB_MODE`。现在的二进制还不读它，所以界面上选了模式也要等这份规格落地之后才改变跑法。
 
 ## 指标
 

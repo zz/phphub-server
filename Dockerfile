@@ -1,4 +1,6 @@
-# PHPHub runtime image.
+# PHPHub runtime image, for local development. The published image
+# (zhuzhu/php:8.5-phalcon-5.23-phphub) is built by images/phphub in
+# docker-build-phalcon from the same stages.
 #
 # libphp (ZTS) and the extensions come from the FrankenPHP image that
 # docker-build-phalcon publishes; Phalcon is not compiled here. That image is
@@ -17,9 +19,9 @@ COPY src src
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked && cp target/release/phphub /phphub
-# Shared libraries that libphp, the extensions and phphub need at run time.
+# Shared libraries that libphp, the extensions, php and phphub need at run time.
 RUN scanelf --needed --nobanner --format '%n#p' --recursive \
-        /usr/local/lib/libphp.so /usr/local/lib/php/extensions /phphub \
+        /usr/local/lib/libphp.so /usr/local/lib/php/extensions /usr/local/bin/php /phphub \
     | tr ',' '\n' | sort -u \
     | awk 'system("[ -e /usr/local/lib/" $1 " ]") == 0 { next } { print "so:" $1 }' \
     > /rundeps
@@ -30,6 +32,8 @@ RUN apk add --no-cache $(cat /tmp/rundeps) && rm /tmp/rundeps
 COPY --from=php /usr/local/lib/libphp.so /usr/local/lib/libphp.so
 COPY --from=php /usr/local/lib/php/extensions /usr/local/lib/php/extensions
 COPY --from=php /usr/local/etc/php /usr/local/etc/php
+# The CLI is for cron and console tasks in the same image; it is not PHPHub.
+COPY --from=php /usr/local/bin/php /usr/local/bin/php-config /usr/local/bin/
 COPY --from=php /etc/localtime /etc/localtime
 COPY --from=php /etc/timezone /etc/timezone
 COPY --from=build /phphub /usr/local/bin/phphub

@@ -36,6 +36,8 @@ pub struct Job {
     pub shared: Arc<JobShared>,
     pub tx: Option<oneshot::Sender<Reply>>,
     head: Bytes,
+    /// File mode: offset of the chosen script in the arena.
+    script_file: Option<(usize, usize)>,
     method: Range<usize>,
     path: Range<usize>,
     // Backing storage for the pointers in `creq`.
@@ -57,6 +59,14 @@ impl Job {
         String::from_utf8_lossy(&self.head[self.path.clone()]).into_owned()
     }
 
+    /// The script this request runs, for log lines.
+    pub fn script<'a>(&'a self, entry: &'a str) -> std::borrow::Cow<'a, str> {
+        match self.script_file {
+            Some((o, l)) => String::from_utf8_lossy(&self._arena[o..o + l]),
+            None => std::borrow::Cow::Borrowed(entry),
+        }
+    }
+
     /// Claim for a PHP thread. False when the connection already gave up.
     pub fn claim(&self, idx: usize) -> bool {
         self.shared.owner.compare_exchange(OWNER_NONE, idx, Ordering::AcqRel, Ordering::Acquire).is_ok()
@@ -75,6 +85,16 @@ pub struct Parts<'a> {
     pub body: Bytes,
     pub remote: SocketAddr,
     pub local: SocketAddr,
+    pub script: Script,
+}
+
+/// Which script this request runs and how `$_SERVER` names it.
+pub enum Script {
+    /// The entry script (WORKER_SCRIPT). `path_info` adds an empty PATH_INFO,
+    /// as file mode does for every request.
+    Entry { path_info: bool },
+    /// File mode: a PHP file under the document root.
+    File(crate::statics::PhpFile),
 }
 
 enum Src {
@@ -190,10 +210,6 @@ pub fn build(p: Parts, cfg: &'static Config, seq: u64, tx: oneshot::Sender<Reply
         (b"REQUEST_METHOD", Src::Arena(method.0, method.1)),
         (b"REQUEST_URI", Src::Arena(uri.0, uri.1)),
         (b"QUERY_STRING", Src::Arena(query.0, query.1)),
-        (b"SCRIPT_NAME", Src::Static(cfg.script_name.as_bytes())),
-        (b"SCRIPT_FILENAME", Src::Static(cfg.worker_script.as_bytes())),
-        (b"PHP_SELF", Src::Static(cfg.script_name.as_bytes())),
-        (b"DOCUMENT_URI", Src::Static(cfg.script_name.as_bytes())),
         (b"DOCUMENT_ROOT", Src::Static(cfg.server_root.as_bytes())),
         (b"SERVER_PROTOCOL", Src::Static(protocol)),
         (b"GATEWAY_INTERFACE", Src::Static(b"CGI/1.1")),
@@ -205,6 +221,40 @@ pub fn build(p: Parts, cfg: &'static Config, seq: u64, tx: oneshot::Sender<Reply
         (b"SERVER_PORT", Src::Arena(server_port.0, server_port.1)),
         (b"SERVER_NAME", server_name),
     ];
+    // The script: fixed for worker and index, per request for file mode.
+    let script_c: Option<(usize, usize)> = match &p.script {
+        Script::Entry { path_info } => {
+            let name = cfg.script_name.as_bytes();
+            vars.push((b"SCRIPT_NAME", Src::Static(name)));
+            vars.push((b"SCRIPT_FILENAME", Src::Static(cfg.worker_script.as_bytes())));
+            vars.push((b"PHP_SELF", Src::Static(name)));
+            vars.push((b"DOCUMENT_URI", Src::Static(name)));
+            if *path_info {
+                vars.push((b"PATH_INFO", Src::Static(b"")));
+            }
+            None
+        }
+        Script::File(f) => {
+            let filename = push(&mut arena, &f.filename);
+            let name = push(&mut arena, &f.name);
+            vars.push((b"SCRIPT_NAME", Src::Arena(name.0, name.1)));
+            vars.push((b"SCRIPT_FILENAME", Src::Arena(filename.0, filename.1)));
+            vars.push((b"DOCUMENT_URI", Src::Arena(name.0, name.1)));
+            if f.path_info.is_empty() {
+                vars.push((b"PHP_SELF", Src::Arena(name.0, name.1)));
+                vars.push((b"PATH_INFO", Src::Static(b"")));
+            } else {
+                // PHP_SELF is SCRIPT_NAME plus PATH_INFO, as in nginx and FrankenPHP.
+                let mut self_ = f.name.clone();
+                self_.extend_from_slice(&f.path_info);
+                let s = push(&mut arena, &self_);
+                let pi = push(&mut arena, &f.path_info);
+                vars.push((b"PHP_SELF", Src::Arena(s.0, s.1)));
+                vars.push((b"PATH_INFO", Src::Arena(pi.0, pi.1)));
+            }
+            Some(filename)
+        }
+    };
     if let Some((o, l)) = content_type {
         vars.push((b"CONTENT_TYPE", Src::Arena(o, l)));
     }
@@ -261,6 +311,10 @@ pub fn build(p: Parts, cfg: &'static Config, seq: u64, tx: oneshot::Sender<Reply
         num_vars,
         request_time: now,
         proto_num: if p.minor == 0 { 1000 } else { 1001 },
+        script: match script_c {
+            Some(sc) => cstr(Some(sc)),
+            None => cfg.worker_script_c.as_ptr(),
+        },
     });
 
     Job {
@@ -270,6 +324,7 @@ pub fn build(p: Parts, cfg: &'static Config, seq: u64, tx: oneshot::Sender<Reply
         received,
         shared: Arc::new(JobShared { owner: AtomicUsize::new(OWNER_NONE) }),
         tx: Some(tx),
+        script_file: script_c,
         method: p.method,
         path: p.path,
         head: p.head,

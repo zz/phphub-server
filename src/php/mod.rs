@@ -6,13 +6,13 @@ pub mod job;
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::*};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender, select};
 use tokio::sync::mpsc;
 
-use crate::config::Config;
+use crate::config::{Config, RunMode};
 use crate::logln;
 use crate::metrics::{METRICS, ThreadView};
 use job::{Job, OWNER_CANCELLED, OWNER_NONE, Reply};
@@ -83,9 +83,13 @@ impl Pool {
 
         // A script that names phphub_handle_request() is booted before any
         // traffic. Anything else waits for its first request.
-        let initial = match std::fs::read(&cfg.worker_script) {
-            Ok(src) if contains(&src, b"phphub_handle_request") => Mode::Worker,
-            _ => Mode::Unknown,
+        let initial = match cfg.mode {
+            RunMode::Auto => match std::fs::read(&cfg.worker_script) {
+                Ok(src) if contains(&src, b"phphub_handle_request") => Mode::Worker,
+                _ => Mode::Unknown,
+            },
+            RunMode::Worker => Mode::Worker,
+            RunMode::Index | RunMode::File => Mode::Classic,
         };
 
         Pool {
@@ -115,9 +119,15 @@ impl Pool {
         if rc != 0 {
             return Err("PHP failed to start".into());
         }
-        match self.mode() {
-            Mode::Worker => logln!("worker mode: {} boots once per thread", self.cfg.worker_script),
-            _ => logln!("{} has no worker loop yet; the first request decides", self.cfg.worker_script),
+        let entry = &self.cfg.worker_script;
+        match (self.cfg.mode, self.mode()) {
+            (RunMode::Worker, _) => logln!("PHPHUB_MODE=worker: {entry} boots once per thread"),
+            (RunMode::Index, _) => logln!("PHPHUB_MODE=index: {entry} runs once per request"),
+            (RunMode::File, _) => {
+                logln!("PHPHUB_MODE=file: requested .php files run when they exist, otherwise {entry}")
+            }
+            (RunMode::Auto, Mode::Worker) => logln!("worker mode: {entry} boots once per thread"),
+            (RunMode::Auto, _) => logln!("{entry} has no worker loop yet; the first request decides"),
         }
         let mut handles = Vec::new();
         for t in &self.threads {
@@ -149,7 +159,11 @@ impl Pool {
         }
     }
 
+    /// Only PHPHUB_MODE unset lets the process mode move.
     fn set_mode(&self, m: Mode) -> Mode {
+        if self.cfg.mode != RunMode::Auto {
+            return self.mode();
+        }
         let prev = self.mode.swap(m as u8, AcqRel);
         if m == Mode::Worker && prev != Mode::Worker as u8 {
             for t in &self.threads {
@@ -377,6 +391,14 @@ struct ThreadState {
     run_started: Instant,
     run_requests: u64,
     run_worker: bool,
+    /// This run serves one request only (index/file, or a worker fallback).
+    run_once: bool,
+    /// PHPHUB_MODE=worker: the script returned without entering the loop,
+    /// so this thread now runs it per request.
+    index_fallback: bool,
+    /// PHPHUB_MODE=worker: the last boot died before the loop; boot the next
+    /// run inside a request instead of spinning.
+    boot_with_request: bool,
     next_null: NextNull,
     /// "GET /path took 1.2s" for the request a crash happened in.
     crash_note: Option<(String, u64)>,
@@ -427,7 +449,7 @@ impl ThreadState {
     /// Streaming is only allowed once the run's mode is settled; output of
     /// a first-request bootstrap may still be thrown away.
     fn may_stream(&self) -> bool {
-        self.run_worker || self.pool.mode() == Mode::Classic
+        self.run_worker || self.run_once || self.pool.mode() == Mode::Classic
     }
 
     fn finish_current(&mut self, crashed: bool) {
@@ -436,6 +458,7 @@ impl ThreadState {
         let took = a.started.elapsed();
         let total = a.job.received.elapsed();
         let method = a.job.method().to_string();
+        let script = a.job.script(self.pool.script()).into_owned();
         let path = if self.pool.cfg.slowlog.is_some() || crashed { Some(a.job.path()) } else { None };
         let (status, job) = a.finish(crashed);
         self.retired = Some(job);
@@ -450,8 +473,7 @@ impl ThreadState {
         if let (Some(limit), Some(path)) = (self.pool.cfg.slowlog, &path) {
             if total >= limit {
                 logln!(
-                    "slow request method={method} path={path} script={} time={:.3}s status={status}",
-                    self.pool.script(),
+                    "slow request method={method} path={path} script={script} time={:.3}s status={status}",
                     total.as_secs_f64()
                 );
             }
@@ -488,6 +510,7 @@ impl ThreadState {
         let note_str = note.map(|(s, _)| format!(" {s}")).unwrap_or_default();
 
         if handled {
+            self.boot_with_request = false;
             match self.next_null {
                 NextNull::Shutdown => {}
                 NextNull::Restart => {
@@ -504,6 +527,29 @@ impl ThreadState {
                         logln!("thread {idx} crashed ({why}), restarting: script={script}{note_str} uptime={uptime:.1}s");
                     }
                 }
+            }
+        } else if self.run_once {
+            // index/file: PHP already logged a fatal error itself.
+            if fatal {
+                METRICS.classic.crashes.fetch_add(1, Relaxed);
+            }
+        } else if self.pool.cfg.mode == RunMode::Worker {
+            if fatal {
+                // Do not spin on a broken boot: the next run starts inside a
+                // request, which gets the error page.
+                METRICS.worker.crashes.fetch_add(1, Relaxed);
+                if !had_job {
+                    logln!(
+                        "thread {idx} crashed before phphub_handle_request(): script={script} time={uptime:.3}s; next run waits for a request"
+                    );
+                }
+                self.boot_with_request = true;
+            } else {
+                logln!(
+                    "error: {script} returned without calling phphub_handle_request() (PHPHUB_MODE=worker); thread {idx} now runs it once per request"
+                );
+                self.index_fallback = true;
+                self.boot_with_request = false;
             }
         } else if had_job {
             if self.pool.mode() == Mode::Unknown {
@@ -522,7 +568,6 @@ impl ThreadState {
                 "thread {idx} crashed before phphub_handle_request(): script={script} time={uptime:.3}s; next run waits for a request"
             );
             self.pool.set_mode(Mode::Unknown);
-            std::thread::sleep(Duration::from_millis(100));
         } else {
             logln!("{script} returned without calling phphub_handle_request(); running it once per request (classic)");
             self.pool.set_mode(Mode::Classic);
@@ -543,6 +588,9 @@ fn thread_main(pool: &'static Pool, shared: Arc<ThreadShared>) {
         run_started: Instant::now(),
         run_requests: 0,
         run_worker: false,
+        run_once: false,
+        index_fallback: false,
+        boot_with_request: false,
         next_null: NextNull::None,
         crash_note: None,
         retired: None,
@@ -557,11 +605,17 @@ fn thread_main(pool: &'static Pool, shared: Arc<ThreadShared>) {
             break;
         }
         let st = unsafe { &mut *st_ptr };
-        let job = if pool.mode() == Mode::Worker {
+        let (boot_worker, once) = match pool.cfg.mode {
+            RunMode::Auto => (pool.mode() == Mode::Worker, false),
+            RunMode::Worker => (!st.index_fallback && !st.boot_with_request, st.index_fallback),
+            RunMode::Index | RunMode::File => (false, true),
+        };
+        st.run_once = once;
+        let job = if boot_worker {
             shared.worker.store(true, Relaxed);
             None
         } else {
-            shared.worker.store(false, Relaxed);
+            shared.worker.store(pool.cfg.mode == RunMode::Worker && !st.index_fallback, Relaxed);
             shared.ready.store(true, Release);
             match st.wait(false) {
                 Wait::Job(j) => Some(j),
@@ -577,7 +631,7 @@ fn thread_main(pool: &'static Pool, shared: Arc<ThreadShared>) {
             Some(j) => st.activate(j),
             None => std::ptr::null(),
         };
-        let flags = unsafe { ffi::phphub_run(ctx, creq) };
+        let flags = unsafe { ffi::phphub_run(ctx, creq, once as c_int) };
         let st = unsafe { &mut *st_ptr };
         st.end_run(flags, had_job);
         st.retired = None;

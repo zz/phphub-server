@@ -6,11 +6,50 @@ use std::time::Duration;
 /// The repository is always mounted here; nothing outside it is served.
 pub const APP_BASE: &str = "/var/www/html";
 
+/// `PHPHUB_MODE`, fixed at startup.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RunMode {
+    /// Unset: a script that calls phphub_handle_request() is a worker,
+    /// anything else runs per request.
+    Auto,
+    Worker,
+    /// The entry script runs once per request.
+    Index,
+    /// The requested .php file runs if it exists, otherwise the entry.
+    File,
+}
+
+impl RunMode {
+    pub fn parse(v: Option<&str>) -> Result<RunMode, String> {
+        match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") => Ok(RunMode::Auto),
+            Some("worker") => Ok(RunMode::Worker),
+            Some("index") => Ok(RunMode::Index),
+            Some("file") => Ok(RunMode::File),
+            Some(_) => Err("PHPHUB_MODE must be worker, index, or file".into()),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            RunMode::Auto => "auto",
+            RunMode::Worker => "worker",
+            RunMode::Index => "index",
+            RunMode::File => "file",
+        }
+    }
+}
+
 pub struct Config {
+    pub mode: RunMode,
     pub listen_port: u16,
     pub metrics_port: u16,
     pub server_root: String,
     pub worker_script: String,
+    /// NUL-terminated copy for C.
+    pub worker_script_c: std::ffi::CString,
+    /// SERVER_ROOT with symlinks resolved, if it exists at startup.
+    pub server_root_real: Option<PathBuf>,
     /// `SCRIPT_NAME` / `PHP_SELF` for requests that go to PHP.
     pub script_name: String,
     pub workers: usize,
@@ -23,6 +62,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Config, String> {
+        let mode = RunMode::parse(std::env::var("PHPHUB_MODE").ok().as_deref())?;
         let server_root = env_or("SERVER_ROOT", APP_BASE);
         check_app_path("SERVER_ROOT", &server_root)?;
         let server_root = server_root.trim_end_matches('/').to_string();
@@ -75,10 +115,14 @@ impl Config {
         let metrics_port = parse_u64("METRICS_PORT", 9100)?;
         let listen_port = parse_u64("PHPHUB_PORT", 80)?;
 
+        let server_root_real = std::fs::canonicalize(&server_root).ok();
         Ok(Config {
+            mode,
             listen_port: port(listen_port, "PHPHUB_PORT")?,
             metrics_port: port(metrics_port, "METRICS_PORT")?,
             server_root,
+            worker_script_c: std::ffi::CString::new(script.clone()).map_err(|_| "WORKER_SCRIPT has a NUL byte")?,
+            server_root_real,
             worker_script: script,
             script_name,
             workers,
@@ -217,6 +261,20 @@ mod tests {
         assert_eq!(parse_size("1000"), Some(1000));
         assert_eq!(parse_size("x"), None);
         assert_eq!(parse_size("0"), None);
+    }
+
+    #[test]
+    fn modes() {
+        assert_eq!(RunMode::parse(None), Ok(RunMode::Auto));
+        assert_eq!(RunMode::parse(Some("")), Ok(RunMode::Auto));
+        assert_eq!(RunMode::parse(Some("  ")), Ok(RunMode::Auto));
+        assert_eq!(RunMode::parse(Some(" Worker ")), Ok(RunMode::Worker));
+        assert_eq!(RunMode::parse(Some("INDEX")), Ok(RunMode::Index));
+        assert_eq!(RunMode::parse(Some("file\n")), Ok(RunMode::File));
+        assert_eq!(
+            RunMode::parse(Some("fpm")),
+            Err("PHPHUB_MODE must be worker, index, or file".to_string())
+        );
     }
 
     #[test]

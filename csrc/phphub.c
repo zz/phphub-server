@@ -42,6 +42,8 @@ typedef struct {
   int live;
   int handle_called;
   int loop_done;
+  int once;
+  int once_used;
   _Atomic uint64_t cur_seq;
   _Atomic uint64_t kill_seq;
   zend_atomic_bool *vm_interrupt;
@@ -341,7 +343,8 @@ static void hub_attach(hub_ctx *c, const hub_request *r) {
   SG(request_info).request_uri = r ? (char *)r->uri : NULL;
   SG(request_info).content_type = r ? r->content_type : NULL;
   SG(request_info).content_length = r ? r->content_length : 0;
-  SG(request_info).path_translated = (char *)c->script;
+  SG(request_info).path_translated =
+      (char *)((r && r->script) ? r->script : c->script);
   SG(request_info).proto_num = r ? r->proto_num : 1000;
   php_handle_auth_data(r ? r->authorization : NULL);
 }
@@ -453,6 +456,15 @@ PHP_FUNCTION(phphub_handle_request) {
   ZEND_PARSE_PARAMETERS_NONE();
   hub_ctx *c = tctx;
   if (!c) {
+    RETURN_FALSE;
+  }
+
+  /* index and file modes: serve the attached request once, never loop. */
+  if (c->once) {
+    if (!c->once_used && c->live) {
+      c->once_used = 1;
+      RETURN_TRUE;
+    }
     RETURN_FALSE;
   }
 
@@ -681,12 +693,15 @@ void phphub_thread_free(void *ctx) {
 
 /* Run the script once. With `req` the script starts inside that request;
  * without it the script is a worker booting before any traffic. */
-int phphub_run(void *ctx, const hub_request *req) {
+int phphub_run(void *ctx, const hub_request *req, int once) {
   hub_ctx *c = ctx;
   volatile int flags = 0;
+  const char *volatile script = (req && req->script) ? req->script : c->script;
 
   c->handle_called = 0;
   c->loop_done = 0;
+  c->once = once;
+  c->once_used = 0;
   c->live = req != NULL;
   hub_attach(c, req);
 
@@ -695,7 +710,7 @@ int phphub_run(void *ctx, const hub_request *req) {
       flags |= HUB_RUN_FATAL;
     } else {
       zend_file_handle fh;
-      zend_stream_init_filename(&fh, c->script);
+      zend_stream_init_filename(&fh, script);
       fh.primary_script = 1;
       EG(exit_status) = 0;
       if (!php_execute_script(&fh) || EG(exit_status) == 255) {

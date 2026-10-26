@@ -40,10 +40,31 @@ A front controller that never calls `phphub_handle_request()` still works: it
 runs once per request on an already warm interpreter (label `classic` in the
 metrics). Use the loop for real traffic and benchmarks.
 
+## Modes
+
+`PHPHUB_MODE` is read once at startup (trimmed, case-insensitive). Spec:
+[docs/modes.md](docs/modes.md).
+
+| `PHPHUB_MODE` | Which script runs |
+|---|---|
+| unset or empty | Auto: a script whose source names `phphub_handle_request` boots as a worker; otherwise the first request decides, and a script without the loop runs once per request. |
+| `worker` | The entry boots once per thread and loops. If it returns without calling `phphub_handle_request()`, an error is logged and that thread runs it once per request from then on. |
+| `index` | The entry runs once per request. A loop in it gets `true` once, then `false`. Never becomes a worker. |
+| `file` | Like nginx or FrankenPHP's `php_server`: an existing `.php`/`.phtml`/`.phar`/`.inc` file under `SERVER_ROOT` named by the URL runs (with `PATH_INFO` for `/a.php/extra`); anything else runs the entry. Symlinks that leave `SERVER_ROOT` count as missing. |
+| anything else | The process logs `PHPHUB_MODE must be worker, index, or file` and exits non-zero before listening. |
+
+In every mode static files, the dotfile 403 and "PHP source is never sent"
+work the same. `REQUEST_URI` and `QUERY_STRING` are always the client's; no
+`_url` is added. `SCRIPT_FILENAME`, `SCRIPT_NAME`, `PHP_SELF` and
+`DOCUMENT_URI` name the entry, except in file mode when a file was picked.
+Metrics use the entry path as the `worker` label in worker mode and `classic`
+for index and file.
+
 ## Settings
 
 | Variable | Default | |
 |---|---|---|
+| `PHPHUB_MODE` | unset (auto) | `worker`, `index` or `file`; see Modes. |
 | `SERVER_ROOT` | `/var/www/html` | Document root. Absolute, `[A-Za-z0-9/_.-]`, no `..`, inside `/var/www/html`, or the server refuses to start. |
 | `WORKER_SCRIPT` | `SERVER_ROOT/index.php` | Relative to `SERVER_ROOT` or absolute; must be inside `/var/www/html`. |
 | `WORKERS` | CPU quota rounded up, at least 2 | PHP threads. |
@@ -62,8 +83,8 @@ Fixed behaviour:
 - Any path segment starting with `.` gets 403 with an empty body. `.env` and
   `.git` are never served or run.
 - Existing files that are not PHP are sent by Rust with `sendfile` and never
-  reach a PHP thread. Everything else goes to the worker script. PHP source is
-  never sent as a file, and only the worker script is executed.
+  reach a PHP thread. Everything else goes to PHP. PHP source is never sent
+  as a file. Only the entry script runs, except in `PHPHUB_MODE=file`.
 - `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Real-Ip` reach `$_SERVER`
   unchanged; PHPHub does not trust them for anything.
 - `display_errors=Off`, `log_errors=On`. Opcache on with
