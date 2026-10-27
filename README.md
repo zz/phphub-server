@@ -68,7 +68,7 @@ for index and file.
 | `SERVER_ROOT` | `/var/www/html` | Document root. Absolute, `[A-Za-z0-9/_.-]`, no `..`, inside `/var/www/html`, or the server refuses to start. |
 | `WORKER_SCRIPT` | `SERVER_ROOT/index.php` | Relative to `SERVER_ROOT` or absolute; must be inside `/var/www/html`. |
 | `WORKERS` | CPU quota rounded up, at least 2 | PHP threads. |
-| `MAX_REQUESTS` | `1000` | Restart one thread's PHP after this many requests; thread `i` (from 0) after `MAX_REQUESTS + i`, so threads do not restart together. `0` never. |
+| `MAX_REQUESTS` | `1000` | Worker loop only. Restart one thread's PHP after this many requests; thread `i` (from 0) after `MAX_REQUESTS + i`, so threads do not restart together. `0` never. `index` and `file` read the value and do not recycle. |
 | `PHP_TIMEOUT` | `60` | Whole seconds, at least 1, a request may take from arrival, queue time included. After that the client gets 504 and the PHP thread is aborted and restarted. Also the drain time on stop. |
 | `TRUSTED_PROXIES` | empty | CIDRs (or single IPs), comma or space separated. A peer in this list may set `REMOTE_ADDR` with `REAL_IP_HEADER`. Empty trusts nobody. One invalid entry stops the start. |
 | `REAL_IP_HEADER` | `X-Real-Ip` | `X-Real-Ip` or `CF-Connecting-IP`; anything else stops the start. |
@@ -100,6 +100,17 @@ Fixed behaviour:
   [docs/requests.md](docs/requests.md).
 - `display_errors=Off`, `log_errors=On`. Opcache on with
   `validate_timestamps=1` and `revalidate_freq=2` (conf.d may change these).
+- After conf.d is scanned, the SAPI always sets `expose_php=0`,
+  `display_errors` and `display_startup_errors` from `DISPLAY_ERRORS`,
+  `zlib.output_compression=0`, and both `post_max_size` and
+  `upload_max_filesize` from `BODY_LIMIT`. A file in
+  `/usr/local/etc/php/conf.d` cannot change those. `memory_limit`,
+  `date.timezone`, `session.save_handler` and `session.save_path` are not
+  set by PHPHub, so a conf.d file keeps them. BaseHub mounts an app ini at
+  `zz-basehub.ini` in that directory. `php -i` does not apply the SAPI
+  overrides, so it can still show the image defaults (upload 2M, post 8M).
+  `max_execution_time` in that file also applies to `php` run as the
+  container command.
 - Logs go to standard error, one line each: PHP errors, thread timeouts,
   crashes and restarts, and slow requests when `SLOWLOG` is set. No access log.
 - `phphub <command> [args]` (other than `health`) runs that command in place

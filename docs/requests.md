@@ -7,7 +7,9 @@
 | `PHP_TIMEOUT` | `60` | `120`，对齐原来 php-fpm 的 `request_terminate_timeout` |
 | `MAX_REQUESTS` | `1000` | `650`，对齐原来的 `pm.max_requests`。`0` 表示不回收 |
 
-值写在进程环境里。前台、后台可以不同。跑 `crond` 或一次性 CLI 的进程不要设 `PHPHUB_MODE`，这两个变量对不接 HTTP 的命令也没有意义。
+值写在进程环境里。BaseHub 没有单独的字段，后台把它们放进这个进程的环境。前台、后台可以不同。跑 `crond` 或一次性 CLI 的进程不要设 `PHPHUB_MODE`，这两个变量对不接 HTTP 的命令也没有意义。
+
+`PHP_TIMEOUT` 在 worker、index、file 三种模式里都生效。`MAX_REQUESTS` 只在 worker 循环里回收线程。index 和 file 会读到这个值，每个请求单独跑完，计数在下一次请求前清掉，不按它重启。
 
 ## 超时
 
@@ -24,7 +26,9 @@
 
 ## 回收
 
-一条线程处理满它自己的上限后，只重启这条线程上的 PHP。进程不退出，其它线程不重启。
+回收只发生在 worker 循环里：一条线程处理完当前请求、调用过 `phphub_finish_request()` 之后，才比较自己的计数。打满之后只重启这条线程上的 PHP。进程不退出，其它线程不重启。
+
+`PHPHUB_MODE` 为 `index` 或 `file`，以及自动判断成按次跑的脚本，不进入这个循环。设了 `MAX_REQUESTS` 也不会增加 `phphub_worker_restarts`。
 
 线程是一起启动的。如果每条都用同一个 `MAX_REQUESTS`，它们会在同一批请求里一起重启，前面的请求全部排进剩下的线程。所以线程 `i` 的实际上限是 `MAX_REQUESTS + i`。`i` 从 0 开始，不超过线程数。18 条线程最多错开 17 个请求。`MAX_REQUESTS` 为 0 时都不回收。
 

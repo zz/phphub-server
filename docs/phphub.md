@@ -73,7 +73,9 @@ while (phphub_handle_request()) {
 
 `$_FILES` 的临时文件在 `phphub_finish_request()` 时删掉。上传大小受 `BODY_LIMIT` 限制，默认 32m。
 
-一条线程处理满 `MAX_REQUESTS`（默认 1000）之后，只重启这一条线程上的 PHP，其它线程继续接请求。`0` 表示不重启。这是为了拦住慢慢涨的内存，不是退回每个请求启动一次。
+worker 循环里，一条线程处理满 `MAX_REQUESTS`（默认 1000）之后，只重启这一条线程上的 PHP，其它线程继续接请求。线程 `i` 的上限是 `MAX_REQUESTS + i`。`0` 表示不重启。这是为了拦住慢慢涨的内存，不是退回每个请求启动一次。`index` 和 `file` 会读到这个环境变量，但每个请求单独跑完，不按它回收。`PHP_TIMEOUT` 三种模式都生效。
+
+附加的 `php.ini` 放在 `/usr/local/etc/php/conf.d`，发布镜像没有主 `php.ini`。PHPHub 读完这个目录之后，固定写下 `expose_php=0`、`display_errors`、`zlib.output_compression=0`，并用 `BODY_LIMIT`（默认 32m）盖过 `post_max_size` 和 `upload_max_filesize`。这份附加文件可以改 `memory_limit`、`date.timezone`、`session.save_handler`、`session.save_path`，以及默认的 `max_execution_time` 和 opcache 三项。`php -i` 不经过这次覆盖，仍可能显示上传 2M、post 8M。BaseHub 把应用的附加配置只读挂到 `zz-basehub.ini`。
 
 ## 和未改过的前端控制器
 
@@ -125,7 +127,7 @@ opcache 打开。`validate_timestamps=1`，`revalidate_freq=2`，这样 BaseHub 
 
 停容器时先不接受新连接，等在途请求到 `PHP_TIMEOUT`，再让循环里的 `phphub_handle_request()` 返回 `false`。
 
-BaseHub 按进程写入 `PHPHUB_MODE`。现在的二进制还不读它，所以界面上选了模式也要等这份规格落地之后才改变跑法。
+BaseHub 按进程写入 `PHPHUB_MODE`。当前镜像会读它。`PHP_TIMEOUT`、`MAX_REQUESTS` 和 `BODY_LIMIT` 写在同一份进程环境里。
 
 ## 指标
 

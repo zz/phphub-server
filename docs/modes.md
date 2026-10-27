@@ -1,8 +1,8 @@
 # 运行模式
 
-PHPHub 按进程启动时的 `PHPHUB_MODE` 固定三种跑法。BaseHub 已经会把这个变量写进容器。这份文档是 PHPHub 还要做的事。
+PHPHub 按进程启动时的 `PHPHUB_MODE` 固定三种跑法。BaseHub 已经会把这个变量写进容器。当前镜像会读它。
 
-现在的二进制不读 `PHPHUB_MODE`。脚本正文里有 `phphub_handle_request` 就进 worker，否则每个请求重新包含入口脚本，`SCRIPT_FILENAME` 始终是入口。`/info3.php` 因此不会执行 `info3.php`。
+未设置时：脚本正文里有 `phphub_handle_request` 就进 worker，否则每个请求重新包含入口脚本，`SCRIPT_FILENAME` 始终是入口。`/info3.php` 因此不会执行 `info3.php`。设了 `index` 或 `file` 之后按下面的表走，不再靠扫脚本正文决定。
 
 ## 环境变量
 
@@ -17,6 +17,8 @@ PHPHub 按进程启动时的 `PHPHUB_MODE` 固定三种跑法。BaseHub 已经�
 | 其它值 | 拒绝启动。错误日志一行：`PHPHUB_MODE must be worker, index, or file`。进程以非 0 退出，不要听端口 |
 
 BaseHub 的进程字段 `php_mode` 空着时不写这个变量。三个值原样写入该进程，并覆盖应用环境里的同名变量。前台和后台是两个进程，可以各选各的。Cron 跑 `php console/cli.php` 时不要设，那个进程不是 PHPHub。
+
+`MAX_REQUESTS` 只在下面的 worker 循环里回收线程。`index` 和 `file` 每个请求跑完即止，不按这个值重启。`PHP_TIMEOUT` 三种模式都生效。细节在 [requests.md](requests.md)。
 
 入口脚本仍是 `WORKER_SCRIPT`，默认 `SERVER_ROOT/index.php`，规则不变：绝对路径或相对文档根，必须落在 `/var/www/html` 里。
 
