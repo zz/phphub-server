@@ -51,6 +51,8 @@ typedef struct {
   /* EG(timeout_seconds) before a kick changed it for the error message. */
   zend_long saved_timeout;
   int timeout_changed;
+  /* A kick raised the timeout; Rust already logged it in one line. */
+  int kicked;
 } hub_ctx;
 
 static __thread hub_ctx *tctx = NULL;
@@ -186,6 +188,11 @@ static void hub_register_variables(zval *track_vars_array) {
 
 static void hub_log_message(const char *msg, int syslog_type) {
   (void)syslog_type;
+  hub_ctx *c = tctx;
+  if (c && c->kicked && strstr(msg, "Maximum execution time")) {
+    c->kicked = 0;
+    return;
+  }
   phphub_rs_log(msg, strlen(msg));
 }
 
@@ -609,6 +616,7 @@ static void hub_interrupt(zend_execute_data *ed) {
         c->timeout_changed = 1;
       }
       EG(timeout_seconds) = hub_timeout_seconds;
+      c->kicked = 1;
       zend_timeout();
     }
   }
@@ -749,6 +757,7 @@ int phphub_run(void *ctx, const hub_request *req, int once) {
     EG(timeout_seconds) = c->saved_timeout;
     c->timeout_changed = 0;
   }
+  c->kicked = 0;
   return flags;
 }
 

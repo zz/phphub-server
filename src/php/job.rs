@@ -121,9 +121,18 @@ pub fn build(p: Parts, cfg: &'static Config, seq: u64, tx: oneshot::Sender<Reply
     let mut host: Option<Range<usize>> = None;
     // Headers passed as HTTP_*: (name, value source)
     let mut pass: Vec<(Range<usize>, Src)> = Vec::with_capacity(p.headers.len());
+    // REAL_IP_HEADER is only looked at when the peer is a trusted proxy.
+    let rip = &cfg.real_ip;
+    let trusted = !rip.disabled() && rip.trusts(p.remote.ip());
+    let mut real: Option<Range<usize>> = None;
+    let mut real_repeated = false;
 
     for (i, (n, v)) in p.headers.iter().enumerate() {
         let name = &head[n.clone()];
+        if trusted && name.eq_ignore_ascii_case(rip.header().as_bytes()) {
+            real_repeated |= real.is_some();
+            real = Some(v.clone());
+        }
         if name.eq_ignore_ascii_case(b"content-type") {
             content_type = Some(v.clone());
             continue;
@@ -185,7 +194,14 @@ pub fn build(p: Parts, cfg: &'static Config, seq: u64, tx: oneshot::Sender<Reply
     let content_length_str = content_length.map(|r| push(&mut arena, &head[r]));
     let authorization = authorization.map(|r| push(&mut arena, &head[r]));
 
-    let remote_addr = push(&mut arena, p.remote.ip().to_string().as_bytes());
+    let mut remote_ip = p.remote.ip();
+    if let Some(v) = &real {
+        match crate::realip::single_ip(&head[v.clone()]) {
+            Some(ip) if !real_repeated => remote_ip = ip,
+            _ => crate::realip::warn_invalid(rip.header(), if real_repeated { b"(repeated header)" } else { &head[v.clone()] }),
+        }
+    }
+    let remote_addr = push(&mut arena, remote_ip.to_string().as_bytes());
     let remote_port = push(&mut arena, p.remote.port().to_string().as_bytes());
     let server_addr = push(&mut arena, p.local.ip().to_string().as_bytes());
     let server_port = push(&mut arena, p.local.port().to_string().as_bytes());

@@ -20,6 +20,18 @@ while (phphub_handle_request()) {
             usleep((int)($_GET['ms'] ?? 0) * 1000);
             echo 'slept';
             break;
+        case '/upload-spin':
+            file_put_contents('/tmp/last-upload', $_FILES['f']['tmp_name'] ?? 'none');
+            while (true) { }
+        case '/stream-spin':
+            echo "part1\n"; flush();
+            while (true) { }
+        case '/after':
+            // Answer, then keep the thread busy outside any request.
+            echo 'answered';
+            phphub_finish_request();
+            usleep((int)($_GET['ms'] ?? 0) * 1000);
+            break;
         case '/spin':
             while (true) { }
         case '/fatal':

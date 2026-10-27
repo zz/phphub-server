@@ -446,6 +446,13 @@ impl ThreadState {
         &*a.job.creq
     }
 
+    /// Thread `i` restarts after MAX_REQUESTS + i requests, so threads that
+    /// started together do not all restart in the same batch of requests.
+    fn request_limit(&self) -> Option<u64> {
+        let max = self.pool.cfg.max_requests;
+        (max > 0).then(|| max + self.shared.idx as u64)
+    }
+
     /// Streaming is only allowed once the run's mode is settled; output of
     /// a first-request bootstrap may still be thrown away.
     fn may_stream(&self) -> bool {
@@ -459,7 +466,10 @@ impl ThreadState {
         let total = a.job.received.elapsed();
         let method = a.job.method().to_string();
         let script = a.job.script(self.pool.script()).into_owned();
-        let path = if self.pool.cfg.slowlog.is_some() || crashed { Some(a.job.path()) } else { None };
+        // Only requests that ended normally are compared with SLOWLOG.
+        let timed_out = self.shared.kicked_seq.load(Acquire) == seq;
+        let slow_check = self.pool.cfg.slowlog.filter(|_| !crashed && !timed_out);
+        let path = if slow_check.is_some() || crashed { Some(a.job.path()) } else { None };
         let (status, job) = a.finish(crashed);
         self.retired = Some(job);
 
@@ -470,7 +480,7 @@ impl ThreadState {
         stats.requests.fetch_add(1, Relaxed);
         stats.time_us.fetch_add(took.as_micros() as u64, Relaxed);
 
-        if let (Some(limit), Some(path)) = (self.pool.cfg.slowlog, &path) {
+        if let (Some(limit), Some(path)) = (slow_check, &path) {
             if total >= limit {
                 logln!(
                     "slow request method={method} path={path} script={script} time={:.3}s status={status}",
@@ -516,8 +526,9 @@ impl ThreadState {
                 NextNull::Restart => {
                     METRICS.worker.restarts.fetch_add(1, Relaxed);
                     logln!(
-                        "thread {idx} restarted after {} requests (MAX_REQUESTS) script={script} uptime={uptime:.1}s",
-                        self.run_requests
+                        "thread {idx} restarted after {} requests (MAX_REQUESTS={}, +{idx} for thread {idx}) script={script} uptime={uptime:.1}s",
+                        self.run_requests,
+                        self.pool.cfg.max_requests
                     );
                 }
                 NextNull::None => {
@@ -671,7 +682,7 @@ pub extern "C" fn phphub_rs_next(rs: *mut c_void) -> *const ffi::HubRequest {
         let a = st.current.insert(a);
         return &*a.job.creq;
     }
-    if st.pool.cfg.max_requests > 0 && st.run_requests >= st.pool.cfg.max_requests {
+    if st.request_limit().is_some_and(|limit| st.run_requests >= limit) {
         st.next_null = NextNull::Restart;
         return std::ptr::null();
     }

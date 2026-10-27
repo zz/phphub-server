@@ -14,7 +14,8 @@ fail() { printf 'FAIL  %s\n' "$1"; fails=$((fails + 1)); }
 check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (got '$2', want '$3')"; fi; }
 
 cleanup() {
-    docker rm -f s-worker s-slow s-classic s-client s-mworker s-mworker-classic s-index s-file s-fpm >/dev/null 2>&1
+    docker rm -f s-worker s-slow s-classic s-client s-mworker s-mworker-classic s-index s-file s-fpm \
+        s-realip s-realip-cf s-realip-other s-recycle s-timeout s-badcidr s-badhdr s-badtimeout >/dev/null 2>&1
     docker volume rm -f phphub-smoke-app >/dev/null 2>&1
     docker network rm $NET >/dev/null 2>&1
 }
@@ -22,6 +23,7 @@ trap cleanup EXIT
 cleanup
 
 docker network create $NET >/dev/null
+SUBNET=$(docker network inspect $NET -f '{{(index .IPAM.Config 0).Subnet}}')
 docker volume create phphub-smoke-app >/dev/null
 # .git cannot live in this repo, so the fixture is made here.
 docker run --rm -v "$PWD/app":/src:ro -v phphub-smoke-app:/dst alpine:3.24 \
@@ -34,13 +36,21 @@ run() {
         -e SERVER_ROOT=/var/www/html/public "$@" "$IMAGE" >/dev/null
 }
 run s-worker -e WORKERS=2 -e PHP_TIMEOUT=3 -e MAX_REQUESTS=50
-run s-slow -e WORKERS=2 -e SLOWLOG=1
+run s-slow -e WORKERS=2 -e SLOWLOG=1 -e PHP_TIMEOUT=3
 run s-classic -e WORKERS=2 -e WORKER_SCRIPT=classic.php
 run s-mworker -e WORKERS=2 -e PHPHUB_MODE=worker
 run s-mworker-classic -e WORKERS=2 -e PHPHUB_MODE=' Worker ' -e WORKER_SCRIPT=classic.php
 run s-index -e WORKERS=2 -e PHPHUB_MODE=index
 run s-file -e WORKERS=2 -e PHPHUB_MODE=file -e WORKER_SCRIPT=classic.php
 run s-fpm -e PHPHUB_MODE=fpm
+run s-realip -e WORKERS=1 -e TRUSTED_PROXIES="192.0.2.0/24, $SUBNET"
+run s-realip-cf -e WORKERS=1 -e TRUSTED_PROXIES="$SUBNET" -e REAL_IP_HEADER=cf-connecting-ip
+run s-realip-other -e WORKERS=1 -e TRUSTED_PROXIES=192.0.2.0/24
+run s-recycle -e WORKERS=3 -e MAX_REQUESTS=5
+run s-timeout -e WORKERS=1 -e PHP_TIMEOUT=2
+run s-badcidr -e TRUSTED_PROXIES='10.0.0.0/8,10.0.0.0/33'
+run s-badhdr -e TRUSTED_PROXIES=10.0.0.0/8 -e REAL_IP_HEADER=X-Forwarded-For
+run s-badtimeout -e PHP_TIMEOUT=0.5
 docker run -d --name s-client --network $NET alpine:3.24 sleep infinity >/dev/null
 docker exec s-client apk add --no-cache curl >/dev/null
 c() { docker exec s-client curl -s "$@"; }
@@ -48,7 +58,7 @@ code() { docker exec s-client curl -s -o /dev/null -w '%{http_code}' "$@"; }
 
 for _ in $(seq 1 50); do
     ok=1
-    for h in s-worker s-classic s-mworker s-index s-file; do
+    for h in s-worker s-classic s-mworker s-index s-file s-realip s-realip-cf s-realip-other s-recycle s-timeout; do
         [ "$(code http://$h:9100/health)" = 200 ] || ok=0
     done
     [ $ok = 1 ] && break
@@ -66,6 +76,30 @@ check "no leaked GET/POST/COOKIE" "$(c http://s-worker/ | grep -c '"get":\[\],"p
 check "header() does not leak" "$(c -si http://s-worker/header >/dev/null; c -si http://s-worker/ | grep -ci 'x-set-once')" 0
 check "X-Forwarded-For passed through" "$(c -H 'X-Forwarded-For: 9.9.9.9' http://s-worker/ | grep -c '"xff":"9.9.9.9"')" 1
 check "bootstrap output never sent" "$(for i in 1 2 3 4; do c http://s-worker/; done | grep -c bootstrap)" 0
+
+echo "== visitor address"
+CLIENT_IP=$(docker inspect s-client -f "{{(index .NetworkSettings.Networks \"$NET\").IPAddress}}")
+ra() { c "$@" | sed 's/.*"remote_addr":"\([^"]*\)".*/\1/'; }
+check "untrusted: X-Real-Ip ignored" "$(ra -H 'X-Real-Ip: 203.0.113.9' http://s-worker/)" "$CLIENT_IP"
+check "untrusted: X-Real-Ip still in \$_SERVER" "$(c -H 'X-Real-Ip: 203.0.113.9' http://s-worker/ | grep -c '"xri":"203.0.113.9"')" 1
+check "other proxy list: X-Real-Ip ignored" "$(ra -H 'X-Real-Ip: 203.0.113.9' http://s-realip-other/)" "$CLIENT_IP"
+check "trusted: X-Real-Ip is REMOTE_ADDR" "$(ra -H 'X-Real-Ip: 203.0.113.9' http://s-realip/)" 203.0.113.9
+check "trusted: header kept in \$_SERVER" "$(c -H 'X-Real-Ip: 203.0.113.9' http://s-realip/ | grep -c '"xri":"203.0.113.9"')" 1
+check "trusted: IPv6 value" "$(ra -H 'X-Real-Ip: 2001:db8::7' http://s-realip/)" "2001:db8::7"
+check "trusted: header name is case-insensitive" "$(ra -H 'x-real-ip: 203.0.113.10' http://s-realip/)" 203.0.113.10
+check "trusted: next request without header is the peer" "$(ra http://s-realip/)" "$CLIENT_IP"
+check "trusted: list is not adopted" "$(ra -H 'X-Real-Ip: 203.0.113.9, 198.51.100.1' http://s-realip/)" "$CLIENT_IP"
+check "trusted: port is not adopted" "$(ra -H 'X-Real-Ip: 203.0.113.9:80' http://s-realip/)" "$CLIENT_IP"
+check "trusted: junk is not adopted" "$(ra -H 'X-Real-Ip: unknown' http://s-realip/)" "$CLIENT_IP"
+check "trusted: empty is not adopted" "$(ra -H 'X-Real-Ip;' http://s-realip/)" "$CLIENT_IP"
+check "trusted: repeated header is not adopted" "$(ra -H 'X-Real-Ip: 203.0.113.9' -H 'X-Real-Ip: 203.0.113.9' http://s-realip/)" "$CLIENT_IP"
+check "trusted: X-Forwarded-For is not read" "$(ra -H 'X-Forwarded-For: 203.0.113.9' http://s-realip/)" "$CLIENT_IP"
+check "trusted: bad values still 200" "$(code -H 'X-Real-Ip: 1.2.3.4:5' http://s-realip/)" 200
+sleep 0.2
+check "bad header value logged once" "$(docker logs s-realip 2>&1 | grep -c 'not a single IP')" 1
+check "startup line names the header" "$(docker logs s-realip 2>&1 | grep -c 'REMOTE_ADDR comes from X-Real-Ip for TRUSTED_PROXIES (2 networks)')" 1
+check "CF-Connecting-IP adopted" "$(ra -H 'CF-Connecting-IP: 198.51.100.4' -H 'X-Real-Ip: 203.0.113.9' http://s-realip-cf/)" 198.51.100.4
+check "CF: X-Real-Ip ignored" "$(ra -H 'X-Real-Ip: 203.0.113.9' http://s-realip-cf/)" "$CLIENT_IP"
 
 echo "== static and dotfiles"
 check "static file 200" "$(code http://s-worker/style.css)" 200
@@ -101,6 +135,36 @@ check "MAX_REQUESTS restarts keep answering 200" "$codes" 200
 m=$(c http://s-worker:9100/metrics)
 check "restarts counted" "$(echo "$m" | awk '/^phphub_worker_restarts/ {print ($2 > 0)}')" 1
 check "crashes counted" "$(echo "$m" | awk '/^phphub_worker_crashes/ {print ($2 >= 2)}')" 1
+check "timeout is one log line" "$(docker logs s-worker 2>&1 | grep -c -e 'request timed out' -e 'Maximum execution time')" 1
+check "timeout line has method, path, script, time" "$(docker logs s-worker 2>&1 | grep -c 'request timed out (PHP_TIMEOUT=3s) in thread [01]: method=GET path=/spin script=/var/www/html/public/index.php time=3.0')" 1
+for i in $(seq 1 60); do code http://s-recycle/ >/dev/null; done
+sleep 0.2
+lines=$(docker logs s-recycle 2>&1 | grep 'restarted after')
+check "recycle: some restarts" "$(echo "$lines" | grep -c . | awk '{print ($1 >= 3)}')" 1
+check "recycle: thread i restarts after MAX_REQUESTS+i" "$(echo "$lines" | sed -n 's/.*thread \([0-9]*\) restarted after \([0-9]*\) requests.*/\1 \2/p' | awk '$2 != 5 + $1' | wc -l | tr -d ' ')" 0
+check "recycle: line names the script" "$(echo "$lines" | grep -vc 'script=/var/www/html/public/index.php')" 0
+check "recycle: counted in phphub_worker_restarts" "$(c http://s-recycle:9100/metrics | awk '/^phphub_worker_restarts/ {print $2}')" "$(echo "$lines" | grep -c .)"
+
+echo "== timeouts in queue, in the body, while streaming, during upload"
+check "busy-after-finish answers" "$(c 'http://s-timeout/after?ms=3500')" answered
+check "queued request gets 504" "$(code 'http://s-timeout/?queued=1')" 504
+sleep 0.2
+check "queued timeout logged in queue" "$(docker logs s-timeout 2>&1 | grep -c 'timed out (PHP_TIMEOUT=2s) in queue: method=GET path=/')" 1
+sleep 1.5
+check "thread answers after the queue timeout" "$(code http://s-timeout/)" 200
+check "queued request never ran" "$(c http://s-timeout:9100/metrics | awk '/^phphub_worker_request_count/ {print $2}')" 2
+check "slow body gets 504" "$(docker exec s-client sh -c "(printf 'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nabc'; sleep 3) | nc s-timeout 80 | head -1 | tr -d '\r'")" "HTTP/1.1 504 Gateway Timeout"
+check "slow body timeout logged" "$(docker logs s-timeout 2>&1 | grep -c 'timed out (PHP_TIMEOUT=2s) reading the body: method=POST path=/')" 1
+out=$(docker exec s-client sh -c 'curl -s -w "|%{http_code}" http://s-timeout/stream-spin; echo "|$?"')
+check "streaming timeout keeps the 200 and cuts the body" "$out" "part1
+|200|18"
+docker exec s-client sh -c 'head -c 200000 /dev/urandom > /tmp/up.bin'
+check "upload that spins gets 504" "$(code -F f=@/tmp/up.bin http://s-timeout/upload-spin)" 504
+sleep 0.3
+tmp=$(docker exec s-timeout cat /tmp/last-upload)
+check "upload temp file was there" "$(echo "$tmp" | grep -c '^/tmp/php')" 1
+check "upload temp file removed after timeout" "$(docker exec s-timeout sh -c "[ -e $tmp ] && echo left || echo gone")" gone
+check "timeouts are not process exits" "$(docker inspect s-timeout --format '{{.State.Running}} {{.RestartCount}}')" "true 0"
 
 echo "== metrics"
 for name in phphub_total_threads phphub_busy_threads phphub_queue_depth phphub_total_workers \
@@ -124,6 +188,9 @@ c 'http://s-slow/sleep?ms=300' >/dev/null
 c 'http://s-slow/sleep?ms=1100' >/dev/null
 sleep 0.2
 check "SLOWLOG=1: one slow line, for the 1.1s request" "$(docker logs s-slow 2>&1 | grep -c 'slow request')" 1
+check "SLOWLOG: timeout is 504" "$(code http://s-slow/spin)" 504
+sleep 0.3
+check "SLOWLOG: timeouts write no slow line" "$(docker logs s-slow 2>&1 | grep -c 'slow request')" 1
 
 echo "== classic front controller"
 check "classic script runs per request" "$(c 'http://s-classic/?a=1' | grep -c '"classic":true,"counter":1')" 1
@@ -187,6 +254,20 @@ check "fpm: process exited" "$(docker inspect s-fpm --format '{{.State.Running}}
 check "fpm: non-zero exit" "$(docker inspect s-fpm --format '{{.State.ExitCode}}' | grep -vc '^0$')" 1
 check "fpm: error line" "$(docker logs s-fpm 2>&1 | grep -c 'PHPHUB_MODE must be worker, index, or file')" 1
 check "fpm: did not listen" "$(docker logs s-fpm 2>&1 | grep -c 'listening')" 0
+
+echo "== settings that refuse to start"
+check "bad CIDR: exited" "$(docker inspect s-badcidr --format '{{.State.Running}} {{.State.ExitCode}}')" "false 1"
+check "bad CIDR: names the entry" "$(docker logs s-badcidr 2>&1 | grep -c 'refusing to start: TRUSTED_PROXIES has an invalid CIDR: 10.0.0.0/33')" 1
+check "bad REAL_IP_HEADER: exited" "$(docker inspect s-badhdr --format '{{.State.Running}} {{.State.ExitCode}}')" "false 1"
+check "bad REAL_IP_HEADER: error line" "$(docker logs s-badhdr 2>&1 | grep -c 'REAL_IP_HEADER must be X-Real-Ip or CF-Connecting-IP: X-Forwarded-For')" 1
+check "PHP_TIMEOUT=0.5: exited" "$(docker inspect s-badtimeout --format '{{.State.Running}} {{.State.ExitCode}}')" "false 1"
+check "PHP_TIMEOUT=0.5: error line" "$(docker logs s-badtimeout 2>&1 | grep -c 'PHP_TIMEOUT must be a whole number of seconds, at least 1')" 1
+
+echo "== other commands in the image"
+check "php CLI runs through the entrypoint" "$(docker run --rm "$IMAGE" php -r 'echo PHP_ZTS ? "zts" : "nts";')" zts
+check "crond runs through the entrypoint" "$(docker run --rm "$IMAGE" sh -c 'timeout 1 crond -f -l 2; echo $?')" 143
+check "unknown command is 127" "$(docker run --rm "$IMAGE" no-such-cmd >/dev/null 2>&1; echo $?)" 127
+check "image has the app extensions" "$(docker run --rm "$IMAGE" php -m | grep -ciE '^(phalcon|redis|memcached|mysqli)$')" 4
 
 echo "== graceful stop"
 docker exec -d s-client sh -c 'curl -s -o /dev/null -w "%{http_code}" "http://s-slow/sleep?ms=1500" > /tmp/drain'

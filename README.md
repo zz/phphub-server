@@ -68,8 +68,10 @@ for index and file.
 | `SERVER_ROOT` | `/var/www/html` | Document root. Absolute, `[A-Za-z0-9/_.-]`, no `..`, inside `/var/www/html`, or the server refuses to start. |
 | `WORKER_SCRIPT` | `SERVER_ROOT/index.php` | Relative to `SERVER_ROOT` or absolute; must be inside `/var/www/html`. |
 | `WORKERS` | CPU quota rounded up, at least 2 | PHP threads. |
-| `MAX_REQUESTS` | `1000` | Restart one thread's PHP after this many requests. `0` never. |
-| `PHP_TIMEOUT` | `60` | Seconds a request may take from arrival. After that the client gets 504 and the PHP thread is aborted and restarted. Also the drain time on stop. |
+| `MAX_REQUESTS` | `1000` | Restart one thread's PHP after this many requests; thread `i` (from 0) after `MAX_REQUESTS + i`, so threads do not restart together. `0` never. |
+| `PHP_TIMEOUT` | `60` | Whole seconds, at least 1, a request may take from arrival, queue time included. After that the client gets 504 and the PHP thread is aborted and restarted. Also the drain time on stop. |
+| `TRUSTED_PROXIES` | empty | CIDRs (or single IPs), comma or space separated. A peer in this list may set `REMOTE_ADDR` with `REAL_IP_HEADER`. Empty trusts nobody. One invalid entry stops the start. |
+| `REAL_IP_HEADER` | `X-Real-Ip` | `X-Real-Ip` or `CF-Connecting-IP`; anything else stops the start. |
 | `BODY_LIMIT` | `32m` | Request body limit (also `post_max_size` and `upload_max_filesize`). |
 | `METRICS_PORT` | `9100` | `/metrics` and `/health`. |
 | `SLOWLOG` | `0` | Seconds; log requests at least this slow. `0` is off. |
@@ -85,12 +87,25 @@ Fixed behaviour:
 - Existing files that are not PHP are sent by Rust with `sendfile` and never
   reach a PHP thread. Everything else goes to PHP. PHP source is never sent
   as a file. Only the entry script runs, except in `PHPHUB_MODE=file`.
-- `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Real-Ip` reach `$_SERVER`
-  unchanged; PHPHub does not trust them for anything.
+- `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Real-Ip` and `CF-Connecting-IP`
+  reach `$_SERVER` unchanged. `REMOTE_ADDR` is the TCP peer, unless the peer
+  is in `TRUSTED_PROXIES` and `REAL_IP_HEADER` holds exactly one IP (no list,
+  no port); then it is that IP. A bad value from a trusted peer is logged
+  once per process. `X-Forwarded-For` is never parsed. See
+  [docs/client-ip.md](docs/client-ip.md).
+- Timeouts: a request still in the queue at `PHP_TIMEOUT` gets 504 without
+  using a PHP thread; a running one gets 504 (or a cut connection once the
+  body has started) and only its thread restarts. One log line with method,
+  path, script and time; no slow-log line. Upload temp files are removed. See
+  [docs/requests.md](docs/requests.md).
 - `display_errors=Off`, `log_errors=On`. Opcache on with
   `validate_timestamps=1` and `revalidate_freq=2` (conf.d may change these).
 - Logs go to standard error, one line each: PHP errors, thread timeouts,
   crashes and restarts, and slow requests when `SLOWLOG` is set. No access log.
+- `phphub <command> [args]` (other than `health`) runs that command in place
+  of the server, so `docker run <image> crond -f` or `... php bin/console`
+  works with the image's ENTRYPOINT. Do not set `PHPHUB_MODE` there, and turn
+  off the image HEALTHCHECK for such containers (`healthcheck: disable: true`).
 - `SIGTERM`: stop accepting, wait up to `PHP_TIMEOUT` for running requests,
   then let `phphub_handle_request()` return `false` and exit.
 

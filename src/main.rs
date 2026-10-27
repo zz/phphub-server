@@ -5,6 +5,7 @@ mod http;
 mod log;
 mod metrics;
 mod php;
+mod realip;
 mod statics;
 
 use std::io::{Read, Write};
@@ -27,8 +28,12 @@ fn main() {
         std::process::exit(health_check());
     }
     if args.len() > 1 {
-        eprintln!("usage: phphub [health]");
-        std::process::exit(2);
+        // ENTRYPOINT passthrough: `docker run <image> crond -f` or
+        // `... php bin/console` runs that command instead of the server.
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(&args[1]).args(&args[2..]).exec();
+        eprintln!("phphub: cannot run {}: {err}", args[1]);
+        std::process::exit(if err.kind() == std::io::ErrorKind::NotFound { 127 } else { 126 });
     }
 
     let cfg: &'static Config = match Config::from_env() {
@@ -119,6 +124,10 @@ async fn serve(cfg: &'static Config, pool: &'static Pool) -> bool {
         cfg.server_root,
         cfg.worker_script
     );
+
+    if !cfg.real_ip.disabled() {
+        logln!("REMOTE_ADDR comes from {} for TRUSTED_PROXIES ({})", cfg.real_ip.header(), cfg.real_ip.describe());
+    }
 
     tokio::spawn(metrics_server(mlistener, pool));
 

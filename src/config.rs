@@ -58,6 +58,8 @@ pub struct Config {
     pub php_timeout: Duration,
     pub display_errors: bool,
     pub slowlog: Option<Duration>,
+    /// TRUSTED_PROXIES and REAL_IP_HEADER, compiled once.
+    pub real_ip: crate::realip::RealIp,
 }
 
 impl Config {
@@ -106,14 +108,20 @@ impl Config {
         let body_limit = parse_size(&env_or("BODY_LIMIT", "32m"))
             .ok_or_else(|| "BODY_LIMIT must look like 32m, 512k or 1048576".to_string())?;
         let max_requests = parse_u64("MAX_REQUESTS", 1000)?;
-        let timeout = parse_u64("PHP_TIMEOUT", 60)?;
-        if timeout == 0 {
-            return Err("PHP_TIMEOUT must be at least 1 second".into());
-        }
+        let timeout = env_or("PHP_TIMEOUT", "60");
+        let timeout: u64 = match timeout.trim().parse() {
+            Ok(n) if n >= 1 => n,
+            _ => return Err(format!("PHP_TIMEOUT must be a whole number of seconds, at least 1: {timeout}")),
+        };
         let slowlog = env_or("SLOWLOG", "0");
         let slowlog: f64 = slowlog.parse().map_err(|_| format!("SLOWLOG is not a number of seconds: {slowlog}"))?;
         let metrics_port = parse_u64("METRICS_PORT", 9100)?;
         let listen_port = parse_u64("PHPHUB_PORT", 80)?;
+
+        let real_ip = crate::realip::RealIp::parse(
+            &std::env::var("TRUSTED_PROXIES").unwrap_or_default(),
+            &std::env::var("REAL_IP_HEADER").unwrap_or_default(),
+        )?;
 
         let server_root_real = std::fs::canonicalize(&server_root).ok();
         Ok(Config {
@@ -131,6 +139,7 @@ impl Config {
             php_timeout: Duration::from_secs(timeout),
             display_errors: env_or("DISPLAY_ERRORS", "0") == "1",
             slowlog: if slowlog > 0.0 { Some(Duration::from_secs_f64(slowlog)) } else { None },
+            real_ip,
         })
     }
 

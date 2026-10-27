@@ -196,6 +196,10 @@ pub async fn serve_conn(mut stream: TcpStream, remote: SocketAddr, local: Socket
                     return;
                 }
                 Err(BodyErr::Eof) => return,
+                Err(BodyErr::Timeout) => {
+                    body_timed_out(srv, &mut stream, &req, received).await;
+                    return;
+                }
             }
         } else if let Some(n) = content_length.filter(|&n| n > 0) {
             let n = n as usize;
@@ -203,7 +207,11 @@ pub async fn serve_conn(mut stream: TcpStream, remote: SocketAddr, local: Socket
                 buf.reserve(n - buf.len());
                 match timeout_at(deadline, stream.read_buf(&mut buf)).await {
                     Ok(Ok(r)) if r > 0 => {}
-                    _ => return,
+                    Ok(_) => return,
+                    Err(_) => {
+                        body_timed_out(srv, &mut stream, &req, received).await;
+                        return;
+                    }
                 }
             }
             buf.split_to(n).freeze()
@@ -249,13 +257,29 @@ enum BodyErr {
     TooLarge,
     Bad,
     Eof,
+    Timeout,
 }
 
 async fn read_more(stream: &mut TcpStream, buf: &mut BytesMut, deadline: tokio::time::Instant) -> Result<(), BodyErr> {
     match timeout_at(deadline, stream.read_buf(buf)).await {
         Ok(Ok(n)) if n > 0 => Ok(()),
-        _ => Err(BodyErr::Eof),
+        Ok(_) => Err(BodyErr::Eof),
+        Err(_) => Err(BodyErr::Timeout),
     }
+}
+
+/// PHP_TIMEOUT ran out while the body was still arriving. No PHP thread was
+/// involved; the client is still connected, so it gets a 504.
+async fn body_timed_out(srv: &Server, stream: &mut TcpStream, req: &Req, received: Instant) {
+    let path = String::from_utf8_lossy(&req.head[req.target.clone()]);
+    let path = path.split('?').next().unwrap_or("");
+    logln!(
+        "request timed out (PHP_TIMEOUT={}s) reading the body: method={} path={path} script=- time={:.3}s",
+        srv.cfg.php_timeout.as_secs(),
+        String::from_utf8_lossy(req.method()),
+        received.elapsed().as_secs_f64()
+    );
+    let _ = simple(stream, 504, req.minor, false, req.is_head()).await;
 }
 
 async fn read_chunked(
