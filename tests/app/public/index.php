@@ -32,6 +32,19 @@ while (phphub_handle_request()) {
             phphub_finish_request();
             usleep((int)($_GET['ms'] ?? 0) * 1000);
             break;
+        case '/orphan':
+            // The shell exits at once; its background sleep becomes PID 1's.
+            exec('sh -c "sleep 0.2 >/dev/null 2>&1 &"');
+            echo 'orphaned';
+            break;
+        case '/exitcodes':
+            // PHP waits for these children itself; their codes must survive.
+            exec('sh -c "sleep 0.1; exit 7"', $out, $rc1);
+            system('sh -c "exit 3"', $rc2);
+            $p = proc_open(['sh', '-c', 'sleep 0.1; exit 5'], [], $pipes);
+            $rc3 = proc_close($p);
+            echo "$rc1 $rc2 $rc3\n";
+            break;
         case '/spin':
             while (true) { }
         case '/fatal':

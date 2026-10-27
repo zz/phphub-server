@@ -15,7 +15,7 @@ check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (got '$2', want '$3'
 
 cleanup() {
     docker rm -f s-worker s-slow s-classic s-client s-mworker s-mworker-classic s-index s-file s-fpm \
-        s-realip s-realip-cf s-realip-other s-recycle s-timeout s-badcidr s-badhdr s-badtimeout >/dev/null 2>&1
+        s-realip s-realip-cf s-realip-other s-recycle s-timeout s-badcidr s-badhdr s-badtimeout s-init s-tini >/dev/null 2>&1
     docker volume rm -f phphub-smoke-app >/dev/null 2>&1
     docker network rm $NET >/dev/null 2>&1
 }
@@ -51,6 +51,8 @@ run s-timeout -e WORKERS=1 -e PHP_TIMEOUT=2
 run s-badcidr -e TRUSTED_PROXIES='10.0.0.0/8,10.0.0.0/33'
 run s-badhdr -e TRUSTED_PROXIES=10.0.0.0/8 -e REAL_IP_HEADER=X-Forwarded-For
 run s-badtimeout -e PHP_TIMEOUT=0.5
+run s-init -e WORKERS=4
+run s-tini -e WORKERS=1 --init
 docker run -d --name s-client --network $NET alpine:3.24 sleep infinity >/dev/null
 docker exec s-client apk add --no-cache curl >/dev/null
 c() { docker exec s-client curl -s "$@"; }
@@ -58,7 +60,7 @@ code() { docker exec s-client curl -s -o /dev/null -w '%{http_code}' "$@"; }
 
 for _ in $(seq 1 50); do
     ok=1
-    for h in s-worker s-classic s-mworker s-index s-file s-realip s-realip-cf s-realip-other s-recycle s-timeout; do
+    for h in s-worker s-classic s-mworker s-index s-file s-realip s-realip-cf s-realip-other s-recycle s-timeout s-init s-tini; do
         [ "$(code http://$h:9100/health)" = 200 ] || ok=0
     done
     [ $ok = 1 ] && break
@@ -263,6 +265,30 @@ check "bad REAL_IP_HEADER: error line" "$(docker logs s-badhdr 2>&1 | grep -c 'R
 check "PHP_TIMEOUT=0.5: exited" "$(docker inspect s-badtimeout --format '{{.State.Running}} {{.State.ExitCode}}')" "false 1"
 check "PHP_TIMEOUT=0.5: error line" "$(docker logs s-badtimeout 2>&1 | grep -c 'PHP_TIMEOUT must be a whole number of seconds, at least 1')" 1
 
+echo "== PID 1 reaps exited processes"
+zombies() { docker exec "$1" sh -c 'cat /proc/[0-9]*/stat 2>/dev/null' | grep -c ') Z '; }
+check "PID 1 is the reaper" "$(docker logs s-init 2>&1 | grep -c 'running as PID 1: forwarding signals')" 1
+check "server runs as a child of PID 1" "$(docker exec s-init sh -c 'ps -o pid,ppid,comm' | awk '$2==1 && $3=="phphub"' | wc -l | tr -d ' ')" 1
+for i in $(seq 1 20); do c http://s-init/orphan >/dev/null; done
+sleep 1
+check "orphans are reaped" "$(zombies s-init)" 0
+check "PHP keeps its children's exit codes" "$(c http://s-init/exitcodes)" "7 3 5"
+mix=$(for i in $(seq 1 20); do c http://s-init/orphan >/dev/null & done
+    for i in $(seq 1 16); do c http://s-init/exitcodes & done; wait)
+check "exit codes with concurrent requests and orphans" "$(echo "$mix" | sort -u)" "7 3 5"
+sleep 1
+check "no zombies after the mix" "$(zombies s-init)" 0
+check "--init: tini is PID 1, no second reaper" "$(docker logs s-tini 2>&1 | grep -c 'running as PID 1')" 0
+check "--init: exit codes" "$(c http://s-tini/exitcodes)" "7 3 5"
+check "command exit code passes through PID 1" "$(docker run --rm "$IMAGE" sh -c 'exit 3' >/dev/null 2>&1; echo $?)" 3
+check "command killed by a signal is 128+n" "$(docker run --rm "$IMAGE" sh -c 'kill -9 $$' >/dev/null 2>&1; echo $?)" 137
+check "commands print no PID 1 line" "$(docker run --rm "$IMAGE" true 2>&1 | wc -c | tr -d ' ')" 0
+check "orphans of a command are reaped" "$(docker run --rm "$IMAGE" sh -c 'sh -c "sleep 0.2 &"; sleep 1; cat /proc/[0-9]*/stat' 2>/dev/null | grep -c ') Z ')" 0
+docker kill -s INT s-init >/dev/null
+sleep 1.5
+check "SIGINT: graceful stop through PID 1" "$(docker logs s-init 2>&1 | grep -c 'phphub: stopped')" 1
+check "SIGINT: clean exit" "$(docker inspect s-init --format '{{.State.Running}} {{.State.ExitCode}}')" "false 0"
+
 echo "== other commands in the image"
 check "php CLI runs through the entrypoint" "$(docker run --rm "$IMAGE" php -r 'echo PHP_ZTS ? "zts" : "nts";')" zts
 check "crond runs through the entrypoint" "$(docker run --rm "$IMAGE" sh -c 'timeout 1 crond -f -l 2; echo $?')" 143
@@ -275,6 +301,7 @@ sleep 0.3
 docker stop -t 20 s-slow >/dev/null
 check "in-flight request finishes on stop" "$(docker exec s-client cat /tmp/drain)" 200
 check "clean exit" "$(docker inspect s-slow --format '{{.State.ExitCode}}')" 0
+check "SIGTERM: drained and stopped through PID 1" "$(docker logs s-slow 2>&1 | grep -c 'phphub: stopped')" 1
 
 echo
 if [ "$fails" -eq 0 ]; then echo "all checks passed"; else echo "$fails checks failed"; fi

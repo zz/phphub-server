@@ -2,6 +2,7 @@
 
 mod config;
 mod http;
+mod init;
 mod log;
 mod metrics;
 mod php;
@@ -24,6 +25,9 @@ use php::Pool;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // Without `docker run --init`, PHPHub is PID 1 and must reap orphans.
+    // Only the server says so; other commands keep their output clean.
+    init::become_init_if_pid1(args.len() > 1);
     if args.get(1).map(String::as_str) == Some("health") {
         std::process::exit(health_check());
     }

@@ -117,8 +117,15 @@ Fixed behaviour:
   of the server, so `docker run <image> crond -f` or `... php bin/console`
   works with the image's ENTRYPOINT. Do not set `PHPHUB_MODE` there, and turn
   off the image HEALTHCHECK for such containers (`healthcheck: disable: true`).
-- `SIGTERM`: stop accepting, wait up to `PHP_TIMEOUT` for running requests,
-  then let `phphub_handle_request()` return `false` and exit.
+- `SIGTERM` or `SIGINT`: stop accepting, wait up to `PHP_TIMEOUT` for running
+  requests, then let `phphub_handle_request()` return `false` and exit.
+- As PID 1 (no `docker run --init`), PHPHub forks once at start, as tini
+  does. PID 1 forwards signals to the child and reaps every process that
+  exits, including orphans such as a `timeout` left behind by `exec()`. The
+  child runs the server or the command. PHP's own children stay with the
+  child, so `exec()`, `system()` and `proc_close()` keep their exit codes.
+  The container exits with the child's status, or 128+n if signal n killed
+  it. `ps` shows two `phphub` processes. With `--init`, none of this happens.
 
 ## Metrics
 
@@ -161,5 +168,6 @@ that `dlopen()`ed extensions resolve PHP's symbols.
 | `src/http.rs` | HTTP/1.1 parsing, body framing, routing, responses. |
 | `src/statics.rs` | Static files: lookup, conditional and range requests, sendfile. |
 | `src/metrics.rs` | Counters and `/metrics`. |
+| `src/init.rs` | PID 1: signal forwarding and reaping. |
 | `tests/smoke.sh` | Acceptance checks against an image. |
 | `bench/` | Phalcon app and the side-by-side load test. |
