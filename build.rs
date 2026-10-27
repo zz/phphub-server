@@ -24,6 +24,15 @@ fn main() {
     build.flag_if_supported("-Wno-missing-field-initializers");
     build.compile("phphub_sapi");
 
+    // mimalloc replaces musl's malloc for the whole process, libphp and the
+    // extensions included: musl's allocator takes one lock for all threads.
+    // Index mode measured 12-17% more requests per second with it.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        // The plain build, not libmimalloc-secure that -lmimalloc points to,
+        // and listed before libc so its malloc is the one symbols bind to.
+        println!("cargo:rustc-link-lib=dylib:+verbatim=libmimalloc.so.2");
+    }
+
     let prefix = php_config("--prefix");
     println!("cargo:rustc-link-search=native={prefix}/lib");
     println!("cargo:rustc-link-lib=dylib=php");

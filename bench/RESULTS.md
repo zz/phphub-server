@@ -113,3 +113,20 @@ Rebuilding the app per request drops throughput to about a third of the
 worker loop (10k vs 28k req/s on `/`), which is why benchmarks use the loop.
 Closed-loop p99 for PHPHub is again the 1-CPU quota throttling described
 above; FrankenPHP never reaches its quota.
+
+## mimalloc (2026-10-27)
+
+`phphub` linked against Alpine's `libmimalloc.so.2` versus musl's malloc,
+same image otherwise. Phalcon bench app, `--cpus=2`, 4 PHP threads, `wrk -t2
+-c32`, 12 s after a 3 s warm-up, two rounds each.
+
+| Mode, route | musl req/s | mimalloc req/s | musl p50 | mimalloc p50 |
+|---|---:|---:|---:|---:|
+| index `/` | 18,560–18,860 | 21,540–21,640 | 1.61–1.66 ms | 1.41–1.42 ms |
+| index `/item/7` | 18,070–18,870 | 21,240–21,750 | 1.65–1.71 ms | 1.40–1.42 ms |
+| worker `/` | 47,590–48,610 | 52,580–52,670 | 0.60–0.63 ms | 0.54 ms |
+| worker `/item/7` | 55,380–56,910 | 57,480–59,710 | 0.51–0.53 ms | 0.47–0.50 ms |
+
+Index mode, which builds the app per request and allocates the most, gains
+13–18%; worker mode 2–10%. Resident memory after the run is about 10 MiB
+higher (36 vs 27 MiB).

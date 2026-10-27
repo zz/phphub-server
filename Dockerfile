@@ -11,7 +11,7 @@ ARG ALPINE_VERSION=3.24
 FROM ${PHP_IMAGE} AS php
 
 FROM php AS build
-RUN apk add --no-cache cargo rust build-base
+RUN apk add --no-cache cargo rust build-base mimalloc2-dev
 WORKDIR /src
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY csrc csrc

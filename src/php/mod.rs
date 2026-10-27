@@ -511,12 +511,17 @@ impl ThreadState {
         let stats = METRICS.stats(self.run_worker);
         stats.requests.fetch_add(1, Relaxed);
         stats.time_us.fetch_add(took.as_micros() as u64, Relaxed);
+        // Time from arrival until a PHP thread took the request.
+        let queued = total.saturating_sub(took);
+        stats.queue_us.fetch_add(queued.as_micros() as u64, Relaxed);
 
         if let (Some(limit), Some(path)) = (slow_check, &path) {
             if total >= limit {
                 logln!(
-                    "slow request method={method} path={path} script={script} time={:.3}s status={status}",
-                    total.as_secs_f64()
+                    "slow request method={method} path={path} script={script} time={:.3}s queue={:.3}s php={:.3}s status={status}",
+                    total.as_secs_f64(),
+                    queued.as_secs_f64(),
+                    took.as_secs_f64()
                 );
             }
         }

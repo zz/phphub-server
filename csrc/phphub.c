@@ -721,7 +721,11 @@ int phphub_run(void *ctx, const hub_request *req, int once) {
       zend_stream_init_filename(&fh, script);
       fh.primary_script = 1;
       EG(exit_status) = 0;
-      if (!php_execute_script(&fh) || EG(exit_status) == 255) {
+      /* exit() makes this return false as well, so its result says
+       * nothing. Fatal errors bail out (caught below) and they and uncaught
+       * exceptions set exit status 255. */
+      php_execute_script(&fh);
+      if (EG(exit_status) == 255) {
         flags |= HUB_RUN_FATAL;
       }
       zend_destroy_file_handle(&fh);

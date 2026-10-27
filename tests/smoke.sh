@@ -15,7 +15,7 @@ check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (got '$2', want '$3'
 
 cleanup() {
     docker rm -f s-worker s-slow s-classic s-client s-mworker s-mworker-classic s-index s-file s-fpm \
-        s-realip s-realip-cf s-realip-other s-recycle s-timeout s-badcidr s-badhdr s-badtimeout s-init s-tini >/dev/null 2>&1
+        s-realip s-realip-cf s-realip-other s-recycle s-timeout s-badcidr s-badhdr s-badtimeout s-init s-tini s-exit >/dev/null 2>&1
     docker volume rm -f phphub-smoke-app >/dev/null 2>&1
     docker network rm $NET >/dev/null 2>&1
 }
@@ -53,6 +53,7 @@ run s-badhdr -e TRUSTED_PROXIES=10.0.0.0/8 -e REAL_IP_HEADER=X-Forwarded-For
 run s-badtimeout -e PHP_TIMEOUT=0.5
 run s-init -e WORKERS=4
 run s-tini -e WORKERS=1 --init
+run s-exit -e WORKERS=1 -e PHPHUB_MODE=index -e WORKER_SCRIPT=classic.php -e SLOWLOG=1
 docker run -d --name s-client --network $NET alpine:3.24 sleep infinity >/dev/null
 docker exec s-client apk add --no-cache curl >/dev/null
 c() { docker exec s-client curl -s "$@"; }
@@ -60,7 +61,7 @@ code() { docker exec s-client curl -s -o /dev/null -w '%{http_code}' "$@"; }
 
 for _ in $(seq 1 50); do
     ok=1
-    for h in s-worker s-classic s-mworker s-index s-file s-realip s-realip-cf s-realip-other s-recycle s-timeout s-init s-tini; do
+    for h in s-worker s-classic s-mworker s-index s-file s-realip s-realip-cf s-realip-other s-recycle s-timeout s-init s-tini s-exit; do
         [ "$(code http://$h:9100/health)" = 200 ] || ok=0
     done
     [ $ok = 1 ] && break
@@ -210,7 +211,7 @@ check "SLOWLOG: timeouts write no slow line" "$(docker logs s-slow 2>&1 | grep -
 echo "== classic front controller"
 check "classic script runs per request" "$(c 'http://s-classic/?a=1' | grep -c '"classic":true,"counter":1')" 1
 check "classic again starts fresh" "$(c 'http://s-classic/?a=2' | grep -c '"counter":1')" 1
-check "classic metrics label" "$(c http://s-classic:9100/metrics | grep -c 'worker="classic"')" 8
+check "classic metrics label" "$(c http://s-classic:9100/metrics | grep -c 'worker="classic"')" 9
 
 echo "== PHPHUB_MODE unset"
 check "auto: entry is SCRIPT_FILENAME for /info3.php" "$(c http://s-worker/info3.php | grep -c '"script_filename":"\\/var\\/www\\/html\\/public\\/index.php"')" 1
@@ -237,6 +238,19 @@ check "index: SCRIPT_FILENAME is the entry" "$(c http://s-index/info3.php | grep
 check "index: no _url in GET" "$(c 'http://s-index/x/y?b=1' | grep -c '"get":{"b":"1"}')" 1
 check "index: metrics label is classic" "$(c http://s-index:9100/metrics | grep -c 'worker="/var/www/html/public/index.php"')" 0
 check "index: never upgraded to worker" "$(docker logs s-index 2>&1 | grep -c 'worker mode')" 0
+
+echo "== exit() and slow requests in index mode"
+crashes() { c http://s-exit:9100/metrics | awk '/^phphub_worker_crashes/ {print $2}'; }
+check "exit: response sent" "$(code 'http://s-exit/?exit=0') $(c 'http://s-exit/?exit=0')" "200 bye"
+c 'http://s-exit/?exit=3' >/dev/null
+check "exit() is not a crash" "$(crashes)" 0
+check "uncaught exception is 500" "$(code 'http://s-exit/?throw=1')" 500
+check "uncaught exception is a crash" "$(crashes)" 1
+c 'http://s-exit/?sleep=1100&exit=0' >/dev/null
+check "SLOWLOG covers requests that call exit()" "$(docker logs s-exit 2>&1 | grep -c 'slow request method=GET path=/ .* queue=0.0[0-9]*s php=1.[0-9]*s status=200')" 1
+c 'http://s-exit/?sleep=1100' >/dev/null & sleep 0.2; c 'http://s-exit/?sleep=300' >/dev/null; wait
+check "SLOWLOG shows time spent waiting for a thread" "$(docker logs s-exit 2>&1 | grep -c 'queue=0.[89][0-9]*s php=0.3[0-9]*s')" 1
+check "queue time metric" "$(c http://s-exit:9100/metrics | awk '/^phphub_worker_queue_time_seconds/ {print ($2 >= 0.8)}')" 1
 
 echo "== PHPHUB_MODE=file"
 f=$(c 'http://s-file/info3.php?q=1')
@@ -306,6 +320,8 @@ echo "== other commands in the image"
 check "php CLI runs through the entrypoint" "$(docker run --rm "$IMAGE" php -r 'echo PHP_ZTS ? "zts" : "nts";')" zts
 check "crond runs through the entrypoint" "$(docker run --rm "$IMAGE" sh -c 'timeout 1 crond -f -l 2; echo $?')" 143
 check "unknown command is 127" "$(docker run --rm "$IMAGE" no-such-cmd >/dev/null 2>&1; echo $?)" 127
+check "phphub runs on mimalloc" "$(docker run --rm -e MIMALLOC_VERBOSE=1 --entrypoint phphub "$IMAGE" health 2>&1 | grep -c '^mimalloc: v')" 1
+check "php CLI keeps musl malloc" "$(docker run --rm -e MIMALLOC_VERBOSE=1 --entrypoint php "$IMAGE" -r 'echo 1;' 2>&1 | grep -c '^mimalloc')" 0
 check "image has the app extensions" "$(docker run --rm "$IMAGE" php -m | grep -ciE '^(phalcon|redis|memcached|mysqli)$')" 4
 
 echo "== graceful stop"

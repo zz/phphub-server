@@ -74,7 +74,7 @@ for index and file.
 | `REAL_IP_HEADER` | `X-Real-Ip` | `X-Real-Ip` or `CF-Connecting-IP`; anything else stops the start. |
 | `BODY_LIMIT` | `32m` | Request body limit (also `post_max_size` and `upload_max_filesize`). |
 | `METRICS_PORT` | `9100` | `/metrics` and `/health`. |
-| `SLOWLOG` | `0` | Seconds; log requests at least this slow. `0` is off. |
+| `SLOWLOG` | `0` | Seconds; log requests at least this slow. `0` is off. The line splits `time=` into `queue=` (waiting for a PHP thread, and reading the body) and `php=`. |
 | `DISPLAY_ERRORS` | `0` | `1` shows PHP errors in pages. |
 | `PHPHUB_PORT` | `80` | HTTP port, for tests. |
 
@@ -138,9 +138,14 @@ The `worker` label is the worker script path, or `classic`.
 `phphub_total_threads`, `phphub_busy_threads`, `phphub_queue_depth`,
 `phphub_total_workers`, `phphub_busy_workers`, `phphub_ready_workers`,
 `phphub_worker_request_count`, `phphub_worker_request_time_seconds`,
+`phphub_worker_queue_time_seconds`,
 `phphub_worker_queue_depth`, `phphub_worker_restarts`, `phphub_worker_crashes`,
 `phphub_opcache_restarts{reason}`, `phphub_http_requests{status}`,
 `phphub_static_requests`, `phphub_rejected_dotfiles`.
+
+`phphub_worker_crashes` counts fatal errors, uncaught exceptions, timeouts
+and a worker loop that ends. `exit()` and `die()` in index, file or classic
+mode end the request normally and are not counted.
 
 `/health` answers `ok` (200) once at least one PHP thread is ready, otherwise
 `unavailable` (503). The image's `HEALTHCHECK` runs `phphub health`.
@@ -160,7 +165,10 @@ publishes. Nothing is compiled against PHP here except PHPHub itself. The
 runtime image is plain Alpine with `libphp.so`, the extensions, their shared
 libraries and `/usr/local/bin/phphub`; no Caddy, no FrankenPHP binary. Rust
 code is linked statically into `phphub`; `libphp.so` and musl stay shared so
-that `dlopen()`ed extensions resolve PHP's symbols.
+that `dlopen()`ed extensions resolve PHP's symbols. `phphub` links Alpine's
+mimalloc (`libmimalloc.so.2`) ahead of musl, so the whole server process,
+libphp and extensions included, allocates with it: musl's malloc takes one
+lock for all threads. The `php` CLI keeps musl's malloc.
 
 ## Layout
 

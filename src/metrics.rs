@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
 pub struct LabelStats {
     pub requests: AtomicU64,
     pub time_us: AtomicU64,
+    pub queue_us: AtomicU64,
     pub restarts: AtomicU64,
     pub crashes: AtomicU64,
 }
@@ -15,6 +16,7 @@ impl LabelStats {
         LabelStats {
             requests: AtomicU64::new(0),
             time_us: AtomicU64::new(0),
+            queue_us: AtomicU64::new(0),
             restarts: AtomicU64::new(0),
             crashes: AtomicU64::new(0),
         }
@@ -104,6 +106,8 @@ pub fn render(script: &str, threads: &[ThreadView], queue_label_worker: bool) ->
         &per(&|w| m.stats(w).requests.load(Relaxed) as f64));
     counter(&mut out, "phphub_worker_request_time_seconds", "Seconds this worker spent on requests.",
         &per(&|w| m.stats(w).time_us.load(Relaxed) as f64 / 1e6));
+    counter(&mut out, "phphub_worker_queue_time_seconds", "Seconds requests for this worker waited for a free PHP thread.",
+        &per(&|w| m.stats(w).queue_us.load(Relaxed) as f64 / 1e6));
     gauge(&mut out, "phphub_worker_queue_depth", "Requests queued for this worker.",
         &per(&|w| if w == queue_label_worker { queue as f64 } else { 0.0 }));
     counter(&mut out, "phphub_worker_restarts", "Planned thread restarts, such as MAX_REQUESTS.",
