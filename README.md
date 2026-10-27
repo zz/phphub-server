@@ -82,6 +82,9 @@ Fixed behaviour:
 
 - HTTP/1.1 with keepalive, no TLS, no HTTP/2 or 3, no compression.
 - No `Server` or `X-Powered-By` header (`expose_php=Off`).
+- A CGI `Status: 302 Found` header from PHP sets the response status and is
+  not sent, as nginx did for php-fpm. It wins over `http_response_code()`
+  and `Location`. An invalid one (not 100-599) gives 500 and one log line.
 - Any path segment starting with `.` gets 403 with an empty body. `.env` and
   `.git` are never served or run.
 - Existing files that are not PHP are sent by Rust with `sendfile` and never

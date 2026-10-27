@@ -317,6 +317,7 @@ impl Active {
     fn send_headers(&mut self, status: u16, lines: &[&[u8]]) {
         self.status = status;
         let mut head = Vec::with_capacity(lines.iter().map(|l| l.len() + 2).sum());
+        let mut cgi_status: Option<&[u8]> = None;
         for line in lines {
             let Some(colon) = line.iter().position(|&b| b == b':') else { continue };
             let name = trim(&line[..colon]);
@@ -335,6 +336,12 @@ impl Active {
             if drop.iter().any(|d| name.eq_ignore_ascii_case(d)) {
                 continue;
             }
+            // CGI `Status: 302 Found` sets the status line and is not sent,
+            // as nginx did for php-fpm. The last one wins.
+            if name.eq_ignore_ascii_case(b"status") {
+                cgi_status = Some(value);
+                continue;
+            }
             if name.eq_ignore_ascii_case(b"content-length") {
                 self.php_len = std::str::from_utf8(value).ok().and_then(|s| s.parse().ok());
                 continue;
@@ -343,6 +350,12 @@ impl Active {
             head.extend_from_slice(b": ");
             head.extend_from_slice(value);
             head.extend_from_slice(b"\r\n");
+        }
+        if let Some(v) = cgi_status {
+            self.status = parse_cgi_status(v).unwrap_or_else(|| {
+                warn_bad_status(v);
+                500
+            });
         }
         self.head = Some(head);
     }
@@ -365,6 +378,25 @@ impl Active {
             });
         }
         (self.status, self.job)
+    }
+}
+
+/// `302`, `302 Found`: three digits, 100 to 599, then nothing or a reason.
+fn parse_cgi_status(v: &[u8]) -> Option<u16> {
+    if v.len() < 3 || !v[..3].iter().all(u8::is_ascii_digit) || v.get(3).is_some_and(|&b| b != b' ' && b != b'\t') {
+        return None;
+    }
+    let n = (v[0] - b'0') as u16 * 100 + (v[1] - b'0') as u16 * 10 + (v[2] - b'0') as u16;
+    (100..600).contains(&n).then_some(n)
+}
+
+static WARNED_STATUS: AtomicBool = AtomicBool::new(false);
+
+/// Logged once per process so one broken page cannot fill the error log.
+fn warn_bad_status(v: &[u8]) {
+    if !WARNED_STATUS.swap(true, Relaxed) {
+        let v: String = String::from_utf8_lossy(&v[..v.len().min(80)]).escape_default().collect();
+        logln!("warning: PHP sent an invalid Status header: \"{v}\"; answered 500 (logged once)");
     }
 }
 
@@ -782,4 +814,21 @@ pub extern "C" fn phphub_rs_opcache_restart(reason: c_int) {
 
 pub fn php_shutdown() {
     unsafe { ffi::phphub_php_shutdown() };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_cgi_status;
+
+    #[test]
+    fn cgi_status() {
+        assert_eq!(parse_cgi_status(b"302"), Some(302));
+        assert_eq!(parse_cgi_status(b"302 Found"), Some(302));
+        assert_eq!(parse_cgi_status(b"404\tNot Found"), Some(404));
+        assert_eq!(parse_cgi_status(b"100"), Some(100));
+        assert_eq!(parse_cgi_status(b"599 Custom"), Some(599));
+        for bad in [&b""[..], b"30", b"abc", b"3020", b"302Found", b"099", b"600", b"999 x", b" 302"] {
+            assert_eq!(parse_cgi_status(bad), None, "{:?}", String::from_utf8_lossy(bad));
+        }
+    }
 }

@@ -124,6 +124,19 @@ check "no X-Powered-By" "$(echo "$h" | grep -ci '^x-powered-by:')" 0
 check "no Content-Encoding with zstd asked" "$(echo "$h" | grep -ci '^content-encoding:')" 0
 check "static: no Content-Encoding" "$(c -si -H 'Accept-Encoding: zstd' http://s-worker/style.css | grep -ci '^content-encoding:')" 0
 
+echo "== CGI Status header"
+U=http://s-worker/cgi-status
+check "Status: 302 Found sets the status" "$(code "$U?s=302%20Found&loc=/x")" 302
+check "Status: Location still sent" "$(c -si "$U?s=302%20Found&loc=/x" | grep -ci '^location: /x')" 1
+check "Status: header not sent to the client" "$(c -si "$U?s=302%20Found&loc=/x" | grep -ci '^status:')" 0
+check "Status: 404 with a body" "$(code "$U?s=404") $(c "$U?s=404")" "404 cgi"
+check "status: any case" "$(code "$U?name=status&s=201")" 201
+check "Status beats http_response_code()" "$(code "$U?code=500&s=200%20OK")" 200
+check "Status beats Location's 302" "$(code "$U?s=301&loc=/y")" 301
+check "Status while streaming" "$(c -s -o /dev/null -w '%{http_code}' "$U?s=503&flush=1") $(c "$U?s=503&flush=1" | head -1)" "503 part1"
+check "invalid Status is 500" "$(code "$U?s=abc") $(code "$U?s=600")" "500 500"
+check "invalid Status logged once" "$(docker logs s-worker 2>&1 | grep -c 'PHP sent an invalid Status header: \"abc\"; answered 500 (logged once)') $(docker logs s-worker 2>&1 | grep -c 'invalid Status header')" "1 1"
+
 echo "== timeouts and restarts"
 docker exec -d s-client sh -c 'curl -s -o /dev/null -w "%{http_code}" http://s-worker/spin > /tmp/spin'
 sleep 0.5

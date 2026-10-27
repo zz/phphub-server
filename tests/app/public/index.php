@@ -55,6 +55,13 @@ while (phphub_handle_request()) {
             setcookie('c1', 'v1');
             echo 'header';
             break;
+        case '/cgi-status':
+            if (isset($_GET['code'])) http_response_code((int)$_GET['code']);
+            if (isset($_GET['loc'])) header('Location: ' . $_GET['loc']);
+            header(($_GET['name'] ?? 'Status') . ': ' . $_GET['s']);
+            if (isset($_GET['flush'])) { echo "part1\n"; flush(); }
+            echo 'cgi';
+            break;
         case '/status':
             http_response_code(201);
             echo 'created';
