@@ -6,6 +6,8 @@ final class App {
 }
 $app = new App();
 $bootedAt = microtime(true);
+// Read once per boot: the reload test changes it and expects new runs to see it.
+$version = trim((string) @file_get_contents('/tmp/phphub-version'));
 echo "bootstrap output must not reach any client\n";
 
 while (phphub_handle_request()) {
@@ -84,6 +86,7 @@ while (phphub_handle_request()) {
                 'app_id' => spl_object_id($app),
                 'served' => $app->served,
                 'booted_at' => $bootedAt,
+                'version' => $version,
                 'get' => $_GET,
                 'post' => $_POST,
                 'cookie' => $_COOKIE,

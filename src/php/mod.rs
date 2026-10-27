@@ -4,7 +4,7 @@ pub mod ffi;
 pub mod job;
 
 use std::ffi::{CString, c_char, c_int, c_void};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -33,6 +33,8 @@ pub enum Mode {
 enum Ctrl {
     Shutdown,
     ModeChanged,
+    /// A reload is pending: restart this thread's PHP if it is stale.
+    Reload,
 }
 
 pub struct ThreadShared {
@@ -45,6 +47,10 @@ pub struct ThreadShared {
     alive: AtomicBool,
     cur_seq: AtomicU64,
     kicked_seq: AtomicU64,
+    /// Pool::reload_gen when this thread's current PHP run started.
+    run_gen: AtomicU64,
+    /// Inside the worker loop (phphub_handle_request()), so a reload applies.
+    in_loop: AtomicBool,
     /// The C context, guarded so a kick never races thread teardown.
     ctx: Mutex<usize>,
 }
@@ -58,6 +64,11 @@ pub struct Pool {
     mode: AtomicU8,
     shutting_down: AtomicBool,
     seq: AtomicU64,
+    /// Bumped by reload(); a worker run that started before is stale.
+    reload_gen: AtomicU64,
+    /// Threads restarting for a reload right now (at most reload_cap()).
+    reloading: AtomicUsize,
+    reload_started: Mutex<Option<Instant>>,
 }
 
 impl Pool {
@@ -76,6 +87,8 @@ impl Pool {
                     alive: AtomicBool::new(false),
                     cur_seq: AtomicU64::new(0),
                     kicked_seq: AtomicU64::new(0),
+                    run_gen: AtomicU64::new(0),
+                    in_loop: AtomicBool::new(false),
                     ctx: Mutex::new(0),
                 })
             })
@@ -101,6 +114,9 @@ impl Pool {
             mode: AtomicU8::new(initial as u8),
             shutting_down: AtomicBool::new(false),
             seq: AtomicU64::new(1),
+            reload_gen: AtomicU64::new(0),
+            reloading: AtomicUsize::new(0),
+            reload_started: Mutex::new(None),
         }
     }
 
@@ -193,6 +209,61 @@ impl Pool {
                 }
                 Some(owner)
             }
+        }
+    }
+
+    /// SIGUSR2: restart every worker thread's PHP so new code is loaded,
+    /// without closing the listener. A busy thread restarts after its current
+    /// request, an idle one at once; at most reload_cap() at a time, so the
+    /// rest keep serving and new requests wait in the queue, none refused.
+    /// index/file runs the script per request already, so there it is a no-op.
+    pub fn reload(&self) {
+        if self.cfg.mode != RunMode::Worker && self.mode() != Mode::Worker {
+            logln!("reload: not in worker mode; every request already runs the current code");
+            return;
+        }
+        let generation = self.reload_gen.fetch_add(1, AcqRel) + 1;
+        *self.reload_started.lock().unwrap() = Some(Instant::now());
+        let stale = self.threads.iter().filter(|t| t.in_loop.load(Acquire)).count();
+        logln!("reload {generation}: restarting {stale} PHP threads, at most {} at a time", self.reload_cap());
+        self.poke_stale(generation);
+        self.check_reload_done();
+    }
+
+    fn reload_cap(&self) -> usize {
+        (self.threads.len() / 4).max(1)
+    }
+
+    fn is_stale(&self, t: &ThreadShared) -> bool {
+        t.run_gen.load(Acquire) < self.reload_gen.load(Acquire)
+    }
+
+    fn try_reload_slot(&self) -> bool {
+        let cap = self.reload_cap();
+        self.reloading.fetch_update(AcqRel, Acquire, |n| (n < cap).then_some(n + 1)).is_ok()
+    }
+
+    /// A reloading thread is serving again (or died trying): let the next go.
+    fn release_reload_slot(&self) {
+        self.reloading.fetch_sub(1, AcqRel);
+        self.poke_stale(self.reload_gen.load(Acquire));
+        self.check_reload_done();
+    }
+
+    fn poke_stale(&self, generation: u64) {
+        for t in &self.threads {
+            if t.in_loop.load(Acquire) && t.run_gen.load(Acquire) < generation {
+                let _ = t.ctrl_tx.send(Ctrl::Reload);
+            }
+        }
+    }
+
+    fn check_reload_done(&self) {
+        if self.reloading.load(Acquire) > 0 || self.threads.iter().any(|t| t.in_loop.load(Acquire) && self.is_stale(t)) {
+            return;
+        }
+        if let Some(t0) = self.reload_started.lock().unwrap().take() {
+            logln!("reload {} done in {:.3}s", self.reload_gen.load(Acquire), t0.elapsed().as_secs_f64());
         }
     }
 
@@ -411,6 +482,7 @@ enum NextNull {
     None,
     Shutdown,
     Restart,
+    Reload,
 }
 
 /// Owned by one PHP thread; C gets a pointer to it.
@@ -437,12 +509,19 @@ struct ThreadState {
     /// The last finished request. SG(request_info) still points into it
     /// until PHP detaches it at the next request or the end of the run.
     retired: Option<Job>,
+    /// Counts PHP runs on this thread.
+    run_serial: u64,
+    /// The run_serial that took a reload slot; released once the next run
+    /// is back in the loop, or ends.
+    reload_slot: Option<u64>,
 }
 
 enum Wait {
     Job(Job),
     Shutdown,
     ModeChanged,
+    /// Stale after a reload, and a reload slot is now held.
+    Reload,
 }
 
 impl ThreadState {
@@ -464,6 +543,12 @@ impl ThreadState {
                             return Wait::ModeChanged;
                         }
                     }
+                    // Outside the loop the next run loads the new code anyway.
+                    Ok(Ctrl::Reload) => {
+                        if in_worker && self.take_reload_slot() {
+                            return Wait::Reload;
+                        }
+                    }
                 },
             }
         }
@@ -476,6 +561,24 @@ impl ThreadState {
         self.retired = None;
         let a = self.current.insert(Active::new(job));
         &*a.job.creq
+    }
+
+    /// Stale after a reload and a slot is free: hold it until the next run is
+    /// back in the loop.
+    fn take_reload_slot(&mut self) -> bool {
+        if self.reload_slot.is_some() || !self.pool.is_stale(&self.shared) || !self.pool.try_reload_slot() {
+            return false;
+        }
+        self.reload_slot = Some(self.run_serial);
+        true
+    }
+
+    /// Release a slot taken by an earlier run (this run is in the loop or ended).
+    fn release_reload_slot(&mut self) {
+        if self.reload_slot.is_some_and(|s| s != self.run_serial) {
+            self.reload_slot = None;
+            self.pool.release_reload_slot();
+        }
     }
 
     /// Thread `i` restarts after MAX_REQUESTS + i requests, so threads that
@@ -556,10 +659,18 @@ impl ThreadState {
         // Timeouts were already logged when they happened.
         let note_str = note.map(|(s, _)| format!(" {s}")).unwrap_or_default();
 
+        self.shared.in_loop.store(false, Release);
         if handled {
             self.boot_with_request = false;
             match self.next_null {
                 NextNull::Shutdown => {}
+                NextNull::Reload => {
+                    METRICS.worker.restarts.fetch_add(1, Relaxed);
+                    logln!(
+                        "thread {idx} reloaded after {} requests (SIGUSR2) script={script} uptime={uptime:.1}s",
+                        self.run_requests
+                    );
+                }
                 NextNull::Restart => {
                     METRICS.worker.restarts.fetch_add(1, Relaxed);
                     logln!(
@@ -624,6 +735,8 @@ impl ThreadState {
         self.next_null = NextNull::None;
         self.run_worker = false;
         self.shared.ready.store(false, Release);
+        // The run that should have replaced a reloaded one died first.
+        self.release_reload_slot();
     }
 }
 
@@ -642,6 +755,8 @@ fn thread_main(pool: &'static Pool, shared: Arc<ThreadShared>) {
         next_null: NextNull::None,
         crash_note: None,
         retired: None,
+        run_serial: 0,
+        reload_slot: None,
     });
     let st_ptr: *mut ThreadState = &mut *st;
     let ctx = unsafe { ffi::phphub_thread_init(st_ptr as *mut c_void, pool.script_c.as_ptr()) };
@@ -668,12 +783,15 @@ fn thread_main(pool: &'static Pool, shared: Arc<ThreadShared>) {
             match st.wait(false) {
                 Wait::Job(j) => Some(j),
                 Wait::Shutdown => break,
-                Wait::ModeChanged => continue,
+                // wait(false) does not take reload slots; nothing to do here.
+                Wait::ModeChanged | Wait::Reload => continue,
             }
         };
 
         st.run_started = Instant::now();
         st.run_requests = 0;
+        st.run_serial += 1;
+        shared.run_gen.store(pool.reload_gen.load(Acquire), Release);
         let had_job = job.is_some();
         let creq = match job {
             Some(j) => st.activate(j),
@@ -709,8 +827,11 @@ pub extern "C" fn phphub_rs_next(rs: *mut c_void) -> *const ffi::HubRequest {
         }
     }
     st.shared.ready.store(true, Release);
+    st.shared.in_loop.store(true, Release);
     // PHP detached the previous request before asking for the next one.
     st.retired = None;
+    // Back in the loop after a reload restart: the next thread may go.
+    st.release_reload_slot();
 
     if let Some(mut a) = st.bootstrap.take() {
         a.body_off = 0;
@@ -727,8 +848,17 @@ pub extern "C" fn phphub_rs_next(rs: *mut c_void) -> *const ffi::HubRequest {
         st.next_null = NextNull::Shutdown;
         return std::ptr::null();
     }
+    // A reload came in while this request ran.
+    if st.take_reload_slot() {
+        st.next_null = NextNull::Reload;
+        return std::ptr::null();
+    }
     match st.wait(true) {
         Wait::Job(j) => st.activate(j),
+        Wait::Reload => {
+            st.next_null = NextNull::Reload;
+            std::ptr::null()
+        }
         _ => {
             st.next_null = NextNull::Shutdown;
             std::ptr::null()

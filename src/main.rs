@@ -158,9 +158,14 @@ async fn serve(cfg: &'static Config, pool: &'static Pool) -> bool {
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM");
     let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).expect("SIGINT");
-    tokio::select! {
-        _ = term.recv() => {},
-        _ = int.recv() => {},
+    let mut usr2 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2()).expect("SIGUSR2");
+    loop {
+        tokio::select! {
+            _ = term.recv() => break,
+            _ = int.recv() => break,
+            // Reload the PHP code without dropping a request; see Pool::reload.
+            _ = usr2.recv() => pool.reload(),
+        }
     }
     logln!("shutting down: no new connections, waiting up to {}s for {} requests", cfg.php_timeout.as_secs(), srv.inflight.load(Acquire));
     let _ = shutdown_tx.send(true);

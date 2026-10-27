@@ -122,6 +122,16 @@ Fixed behaviour:
   off the image HEALTHCHECK for such containers (`healthcheck: disable: true`).
 - `SIGTERM` or `SIGINT`: stop accepting, wait up to `PHP_TIMEOUT` for running
   requests, then let `phphub_handle_request()` return `false` and exit.
+- `SIGUSR2` (worker mode): reload the PHP code without dropping a request. The
+  listener stays open; each thread restarts its PHP after its current request
+  (an idle one at once), at most a quarter of the threads at a time, so the
+  rest keep serving and new requests wait in the queue. Logs
+  `reload N: restarting ...`, one `thread i reloaded` line per thread and
+  `reload N done in Xs`; each counts in `phphub_worker_restarts`. Signals sent
+  while one runs merge into it. Needs `opcache.validate_timestamps=1`: after
+  deploying files, wait longer than `opcache.revalidate_freq` before
+  `docker kill -s USR2 <container>`. In `index`/`file` mode it only logs, since
+  every request already runs the current files.
 - As PID 1 (no `docker run --init`), PHPHub forks once at start, as tini
   does. PID 1 forwards signals to the child and reaps every process that
   exits, including orphans such as a `timeout` left behind by `exec()`. The

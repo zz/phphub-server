@@ -15,7 +15,7 @@ check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (got '$2', want '$3'
 
 cleanup() {
     docker rm -f s-worker s-slow s-classic s-client s-mworker s-mworker-classic s-index s-file s-fpm \
-        s-realip s-realip-cf s-realip-other s-recycle s-timeout s-badcidr s-badhdr s-badtimeout s-init s-tini s-exit >/dev/null 2>&1
+        s-realip s-realip-cf s-realip-other s-recycle s-reload s-reload-index s-timeout s-badcidr s-badhdr s-badtimeout s-init s-tini s-exit >/dev/null 2>&1
     docker volume rm -f phphub-smoke-app >/dev/null 2>&1
     docker network rm $NET >/dev/null 2>&1
 }
@@ -47,6 +47,8 @@ run s-realip -e WORKERS=1 -e TRUSTED_PROXIES="192.0.2.0/24, $SUBNET"
 run s-realip-cf -e WORKERS=1 -e TRUSTED_PROXIES="$SUBNET" -e REAL_IP_HEADER=cf-connecting-ip
 run s-realip-other -e WORKERS=1 -e TRUSTED_PROXIES=192.0.2.0/24
 run s-recycle -e WORKERS=3 -e MAX_REQUESTS=5
+run s-reload -e WORKERS=4 -e PHPHUB_MODE=worker -e MAX_REQUESTS=0
+run s-reload-index -e WORKERS=2 -e PHPHUB_MODE=index
 run s-timeout -e WORKERS=1 -e PHP_TIMEOUT=2
 run s-badcidr -e TRUSTED_PROXIES='10.0.0.0/8,10.0.0.0/33'
 run s-badhdr -e TRUSTED_PROXIES=10.0.0.0/8 -e REAL_IP_HEADER=X-Forwarded-For
@@ -61,7 +63,7 @@ code() { docker exec s-client curl -s -o /dev/null -w '%{http_code}' "$@"; }
 
 for _ in $(seq 1 50); do
     ok=1
-    for h in s-worker s-classic s-mworker s-index s-file s-realip s-realip-cf s-realip-other s-recycle s-timeout s-init s-tini s-exit; do
+    for h in s-worker s-classic s-mworker s-index s-file s-realip s-realip-cf s-realip-other s-recycle s-reload s-reload-index s-timeout s-init s-tini s-exit; do
         [ "$(code http://$h:9100/health)" = 200 ] || ok=0
     done
     [ $ok = 1 ] && break
@@ -160,6 +162,34 @@ check "recycle: some restarts" "$(echo "$lines" | grep -c . | awk '{print ($1 >=
 check "recycle: thread i restarts after MAX_REQUESTS+i" "$(echo "$lines" | sed -n 's/.*thread \([0-9]*\) restarted after \([0-9]*\) requests.*/\1 \2/p' | awk '$2 != 5 + $1' | wc -l | tr -d ' ')" 0
 check "recycle: line names the script" "$(echo "$lines" | grep -vc 'script=/var/www/html/public/index.php')" 0
 check "recycle: counted in phphub_worker_restarts" "$(c http://s-recycle:9100/metrics | awk '/^phphub_worker_restarts/ {print $2}')" "$(echo "$lines" | grep -c .)"
+
+echo "== reload (SIGUSR2)"
+boots() { for i in $(seq 1 40); do c "http://s-reload/?i=$i"; echo; done | sed 's/.*"booted_at":\([0-9.]*\).*/\1/' | sort -u; }
+before=$(boots)
+docker exec s-reload sh -c 'echo v2 > /tmp/phphub-version'
+# Load across the reload: 4 clients x 40 requests, every 4th 200ms long so threads are busy.
+docker exec s-client sh -c 'for k in 1 2 3 4; do (for i in $(seq 1 40); do
+    if [ $((i % 4)) = 0 ]; then u="http://s-reload/sleep?ms=200"; else u="http://s-reload/?k=$k&i=$i"; fi
+    curl -s -o /dev/null -w "%{http_code}\n" "$u"; done > /tmp/reload-$k.txt) & done; wait' &
+load=$!
+sleep 0.5
+docker kill -s USR2 s-reload >/dev/null
+wait $load
+check "reload: every request during the reload is 200" "$(docker exec s-client sh -c 'cat /tmp/reload-*.txt' | grep -vc '^200$')" 0
+check "reload: 160 requests answered" "$(docker exec s-client sh -c 'cat /tmp/reload-*.txt' | grep -c '^200$')" 160
+for _ in $(seq 1 50); do docker logs s-reload 2>&1 | grep -q 'reload 1 done' && break; sleep 0.1; done
+after=$(boots)
+check "reload: no thread kept its old boot" "$(printf '%s\n%s\n' "$before" "$after" | sort | uniq -d | wc -l | tr -d ' ')" 0
+check "reload: new runs see the new code" "$(for i in $(seq 1 20); do c http://s-reload/; echo; done | grep -vc '"version":"v2"')" 0
+rl=$(docker logs s-reload 2>&1)
+check "reload: announced with the cap" "$(echo "$rl" | grep -c 'reload 1: restarting 4 PHP threads, at most 1 at a time')" 1
+check "reload: each thread reloaded once" "$(echo "$rl" | grep -c 'reloaded after .* (SIGUSR2)')" 4
+check "reload: done line" "$(echo "$rl" | grep -c 'reload 1 done in')" 1
+check "reload: counted in phphub_worker_restarts" "$(c http://s-reload:9100/metrics | awk '/^phphub_worker_restarts/ {print $2}')" 4
+check "reload: not a crash" "$(c http://s-reload:9100/metrics | awk '/^phphub_worker_crashes/ {print $2}')" 0
+docker kill -s USR2 s-reload-index >/dev/null
+sleep 0.2
+check "reload: index mode logs and keeps serving" "$(docker logs s-reload-index 2>&1 | grep -c 'reload: not in worker mode'):$(code http://s-reload-index/)" "1:200"
 
 echo "== timeouts in queue, in the body, while streaming, during upload"
 check "busy-after-finish answers" "$(c 'http://s-timeout/after?ms=3500')" answered
