@@ -149,6 +149,7 @@ PHPHub 不打开那个端口。同一类数字放在 `METRICS_PORT` 的 `/metric
 | `phphub_ready_workers{worker}` | gauge | 已经进入过 `phphub_handle_request()` 的线程数。脚本还在启动时不算。 |
 | `phphub_worker_request_count{worker}` | counter | 这个 worker 处理完的请求数。 |
 | `phphub_worker_request_time_seconds{worker}` | counter | 这个 worker 花在请求上的秒数。 |
+| `phphub_request_duration_seconds{worker}` | histogram | 请求从到达到结束的耗时（含排队），桶 5ms–10s，用来算 p50/p95/p99：`histogram_quantile(0.95, sum by (le) (rate(phphub_request_duration_seconds_bucket[5m])))`。 |
 | `phphub_worker_queue_depth{worker}` | gauge | 排在这个 worker 上的请求数。 |
 | `phphub_worker_restarts{worker}` | counter | 主动重启线程的次数。打满 `MAX_REQUESTS` 和 `SIGUSR2` 重载都算在这里。 |
 | `phphub_worker_crashes{worker}` | counter | 线程意外退出的次数。超时和致命错误算在这里。 |

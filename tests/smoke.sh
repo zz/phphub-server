@@ -119,6 +119,9 @@ php_before=$(c http://s-worker:9100/metrics | awk '/^phphub_worker_request_count
 c http://s-worker/style.css >/dev/null
 check "static files skip PHP" "$(c http://s-worker:9100/metrics | awk '/^phphub_worker_request_count/ {print $2}')" "$php_before"
 check "static counter moves" "$(c http://s-worker:9100/metrics | awk '/^phphub_static_requests/ {print $2}')" "$((static_before + 1))"
+m=$(c http://s-worker:9100/metrics)
+check "duration histogram count matches requests" "$(echo "$m" | awk '/^phphub_request_duration_seconds_count\{worker=/ {print $2}')" "$(echo "$m" | awk '/^phphub_worker_request_count\{worker=/ {print $2}')"
+check "duration histogram has +Inf" "$(echo "$m" | grep -c 'phphub_request_duration_seconds_bucket{worker=.*le="+Inf"}')" 1
 
 echo "== response headers"
 h=$(c -si -H 'Accept-Encoding: zstd, br, gzip' http://s-worker/)
@@ -241,7 +244,8 @@ check "SLOWLOG: timeouts write no slow line" "$(docker logs s-slow 2>&1 | grep -
 echo "== classic front controller"
 check "classic script runs per request" "$(c 'http://s-classic/?a=1' | grep -c '"classic":true,"counter":1')" 1
 check "classic again starts fresh" "$(c 'http://s-classic/?a=2' | grep -c '"counter":1')" 1
-check "classic metrics label" "$(c http://s-classic:9100/metrics | grep -c 'worker="classic"')" 9
+# 9 per-worker series plus 16 histogram lines (13 buckets, +Inf, sum, count)
+check "classic metrics label" "$(c http://s-classic:9100/metrics | grep -c 'worker="classic"')" 25
 
 echo "== PHPHUB_MODE unset"
 check "auto: entry is SCRIPT_FILENAME for /info3.php" "$(c http://s-worker/info3.php | grep -c '"script_filename":"\\/var\\/www\\/html\\/public\\/index.php"')" 1

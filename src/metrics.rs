@@ -3,12 +3,50 @@
 use std::fmt::Write;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
 
+/// Upper bounds of `phphub_request_duration_seconds`, in seconds.
+pub const DURATION_BUCKETS: [f64; 13] = [0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+
+/// A Prometheus histogram: one count per bucket (not cumulative; render adds
+/// them up), the last slot for anything above the top bound.
+pub struct Histogram {
+    buckets: [AtomicU64; DURATION_BUCKETS.len() + 1],
+    sum_us: AtomicU64,
+}
+
+impl Histogram {
+    const fn new() -> Self {
+        Histogram { buckets: [const { AtomicU64::new(0) }; DURATION_BUCKETS.len() + 1], sum_us: AtomicU64::new(0) }
+    }
+
+    pub fn observe(&self, d: std::time::Duration) {
+        let secs = d.as_secs_f64();
+        let i = DURATION_BUCKETS.iter().position(|b| secs <= *b).unwrap_or(DURATION_BUCKETS.len());
+        self.buckets[i].fetch_add(1, Relaxed);
+        self.sum_us.fetch_add(d.as_micros() as u64, Relaxed);
+    }
+
+    /// Cumulative counts per bound, then the total.
+    fn cumulative(&self) -> (Vec<u64>, u64) {
+        let mut run = 0;
+        let mut out = Vec::with_capacity(DURATION_BUCKETS.len());
+        for (i, b) in self.buckets.iter().enumerate() {
+            run += b.load(Relaxed);
+            if i < DURATION_BUCKETS.len() {
+                out.push(run);
+            }
+        }
+        (out, run)
+    }
+}
+
 pub struct LabelStats {
     pub requests: AtomicU64,
     pub time_us: AtomicU64,
     pub queue_us: AtomicU64,
     pub restarts: AtomicU64,
     pub crashes: AtomicU64,
+    /// Arrival to finish, queue included: what the client waited for.
+    pub duration: Histogram,
 }
 
 impl LabelStats {
@@ -19,6 +57,7 @@ impl LabelStats {
             queue_us: AtomicU64::new(0),
             restarts: AtomicU64::new(0),
             crashes: AtomicU64::new(0),
+            duration: Histogram::new(),
         }
     }
 }
@@ -115,6 +154,21 @@ pub fn render(script: &str, threads: &[ThreadView], queue_label_worker: bool) ->
     counter(&mut out, "phphub_worker_crashes", "Unexpected thread exits, including timeouts and fatal errors.",
         &per(&|w| m.stats(w).crashes.load(Relaxed) as f64));
 
+    let _ = writeln!(out, "# HELP phphub_request_duration_seconds PHP requests from arrival to finish, queue included.");
+    let _ = writeln!(out, "# TYPE phphub_request_duration_seconds histogram");
+    for (label, w) in &labels {
+        let h = &m.stats(*w).duration;
+        let (cum, total) = h.cumulative();
+        // {worker="x"} -> {worker="x",le="0.1"}
+        let base = label.trim_end_matches('}');
+        for (bound, n) in DURATION_BUCKETS.iter().zip(cum) {
+            let _ = writeln!(out, "phphub_request_duration_seconds_bucket{base},le=\"{bound}\"}} {n}");
+        }
+        let _ = writeln!(out, "phphub_request_duration_seconds_bucket{base},le=\"+Inf\"}} {total}");
+        let _ = writeln!(out, "phphub_request_duration_seconds_sum{label} {}", h.sum_us.load(Relaxed) as f64 / 1e6);
+        let _ = writeln!(out, "phphub_request_duration_seconds_count{label} {total}");
+    }
+
     let oc = &m.opcache_restarts;
     counter(&mut out, "phphub_opcache_restarts", "Opcache shared memory restarts.", &[
         ("{reason=\"oom\"}", oc[0].load(Relaxed) as f64),
@@ -158,4 +212,36 @@ fn family(out: &mut String, name: &str, help: &str, kind: &str, rows: &[(&str, f
 
 fn escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn histogram_is_cumulative_with_inf() {
+        let h = Histogram::new();
+        h.observe(Duration::from_millis(3));
+        h.observe(Duration::from_millis(80));
+        h.observe(Duration::from_millis(100));
+        h.observe(Duration::from_secs(30));
+        let (cum, total) = h.cumulative();
+        assert_eq!(total, 4);
+        assert_eq!(cum[0], 1); // <= 5ms
+        assert_eq!(cum[5], 3); // <= 100ms, the bound itself counts
+        assert_eq!(*cum.last().unwrap(), 3); // <= 10s; 30s only in +Inf
+        assert_eq!(h.sum_us.load(Relaxed), 30_183_000);
+    }
+
+    #[test]
+    fn render_writes_histogram_lines() {
+        METRICS.worker.duration.observe(Duration::from_millis(20));
+        METRICS.worker.requests.fetch_add(1, Relaxed);
+        let text = render("/app/index.php", &[ThreadView { busy: false, ready: true, worker: true }], true);
+        assert!(text.contains("# TYPE phphub_request_duration_seconds histogram"));
+        assert!(text.contains("phphub_request_duration_seconds_bucket{worker=\"/app/index.php\",le=\"0.025\"} "));
+        assert!(text.contains("phphub_request_duration_seconds_bucket{worker=\"/app/index.php\",le=\"+Inf\"} "));
+        assert!(text.contains("phphub_request_duration_seconds_count{worker=\"/app/index.php\"} "));
+    }
 }

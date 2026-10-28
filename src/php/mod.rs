@@ -617,6 +617,7 @@ impl ThreadState {
         // Time from arrival until a PHP thread took the request.
         let queued = total.saturating_sub(took);
         stats.queue_us.fetch_add(queued.as_micros() as u64, Relaxed);
+        stats.duration.observe(total);
 
         if let (Some(limit), Some(path)) = (slow_check, &path) {
             if total >= limit {

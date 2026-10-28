@@ -153,6 +153,13 @@ The `worker` label is the worker script path, or `classic`.
 `phphub_opcache_restarts{reason}`, `phphub_http_requests{status}`,
 `phphub_static_requests`, `phphub_rejected_dotfiles`.
 
+`phphub_request_duration_seconds{worker}` is a histogram of PHP requests from
+arrival to finish, queue included (buckets 5ms to 10s), for percentiles:
+
+```
+histogram_quantile(0.95, sum by (le) (rate(phphub_request_duration_seconds_bucket[5m])))
+```
+
 `phphub_worker_crashes` counts fatal errors, uncaught exceptions, timeouts
 and a worker loop that ends. `exit()` and `die()` in index, file or classic
 mode end the request normally and are not counted.
