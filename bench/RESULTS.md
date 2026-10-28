@@ -130,3 +130,33 @@ same image otherwise. Phalcon bench app, `--cpus=2`, 4 PHP threads, `wrk -t2
 Index mode, which builds the app per request and allocates the most, gains
 13–18%; worker mode 2–10%. Resident memory after the run is about 10 MiB
 higher (36 vs 27 MiB).
+
+## Per-request overhead, direct vs through Octoproxy (2026-10-28)
+
+Command: `bench/overhead.sh`. PHPHub `phphub:dev` (5dc28c3), Octoproxy
+`zhuzhu/octoproxy:latest` (79a9d4e, upstream connections pooled), each
+`--cpus=1`, 2 PHP threads, `wrk -c16` 10 s, every request with 8 browser
+headers and a 170 B cookie. CPU per request from the Docker stats counters.
+
+| Request | Target | req/s | p50 | p99 | CPU/req PHPHub | CPU/req Octoproxy |
+|---|---|---:|---:|---:|---:|---:|
+| GET /hello | direct | 46,359 | 0.22 ms | 34.7 ms | 21.5 µs | |
+| GET /hello | octoproxy | 13,942 | 1.09 ms | 3.4 ms | 29.4 µs | 48.5 µs |
+| GET / (20-row page) | direct | 29,105 | 0.36 ms | 39.0 ms | 34.4 µs | |
+| GET / | octoproxy | 12,134 | 1.25 ms | 4.0 ms | 40.8 µs | 50.7 µs |
+| GET /big (120 KB) | direct | 30,379 | 0.41 ms | 22.6 ms | 32.8 µs | |
+| GET /big | octoproxy | 7,224 | 2.15 ms | 4.9 ms | 48.4 µs | 104.0 µs |
+| POST 20 KB /hello | direct | 10,906 | 0.97 ms | 43.5 ms | 91.5 µs | |
+| POST 20 KB /hello | octoproxy | 8,162 | 1.87 ms | 4.7 ms | 96.5 µs | 61.1 µs |
+
+- PHPHub's own work per request (parse, hand-off to PHP, `$_SERVER`,
+  response) is about 20 µs; the rest of `/` and `/big` is Phalcon. A real
+  atw-web page is 60–70 ms of PHP, so this path is under 0.1% of a request.
+- Before the connection-pool fix (708d1fd) Octoproxy cost 450 µs per request
+  and topped out at 2,100 req/s on one CPU: every request dialed the upstream.
+- With pooling, Octoproxy is ~50 µs per request. `strace -c` on it shows one
+  DNS lookup per request (`sendmmsg`, `socket`, `connect`, three `newfstatat`
+  for `/etc/hosts` and `resolv.conf`): `resolve()` calls `lookup_host` for
+  the upstream name on every request. A short-lived cache is the next step.
+- The direct p99 of 23–43 ms is queueing: 16 closed-loop connections on 2 PHP
+  threads and one CPU.

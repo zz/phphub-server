@@ -26,6 +26,17 @@ namespace Bench\Controllers {
             $r->setContent('hello');
             return $r;
         }
+
+        /** About 120 KB of HTML, the size of a real listing page: sizes the response copy. */
+        public function bigAction(): Response
+        {
+            static $html = null;
+            $html ??= '<!doctype html><html><body>' . str_repeat('<p>' . str_repeat('lorem ipsum ', 20) . '</p>', 500) . '</body></html>';
+            $r = new Response();
+            $r->setContentType('text/html', 'UTF-8');
+            $r->setContent($html);
+            return $r;
+        }
     }
 
     class ItemsController extends Controller
@@ -57,6 +68,7 @@ namespace {
         $router->removeExtraSlashes(true);
         $router->add('/', ['controller' => 'index', 'action' => 'index']);
         $router->add('/hello', ['controller' => 'index', 'action' => 'hello']);
+        $router->add('/big', ['controller' => 'index', 'action' => 'big']);
         $router->add('/item/{id:[0-9]+}', ['controller' => 'items', 'action' => 'show']);
         $router->notFound(['controller' => 'index', 'action' => 'hello']);
         return $router;
