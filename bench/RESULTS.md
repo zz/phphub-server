@@ -160,3 +160,15 @@ headers and a 170 B cookie. CPU per request from the Docker stats counters.
   the upstream name on every request. A short-lived cache is the next step.
 - The direct p99 of 23–43 ms is queueing: 16 closed-loop connections on 2 PHP
   threads and one CPU.
+
+With the upstream name lookup cached (Octoproxy 4f8b285), same setup:
+
+| Request | Target | req/s | p50 | p99 | CPU/req PHPHub | CPU/req Octoproxy |
+|---|---|---:|---:|---:|---:|---:|
+| GET /hello | octoproxy | 23,792 | 0.64 ms | 2.0 ms | 26.1 µs | 26.3 µs |
+| GET /big | octoproxy | 10,024 | 1.55 ms | 3.4 ms | 47.3 µs | 75.4 µs |
+| POST 20 KB /hello | octoproxy | 8,998 | 1.67 ms | 12.0 ms | 108.0 µs | 42.6 µs |
+
+Octoproxy: 450 µs (per-request dial) → 48.5 µs (pooled) → 26.3 µs (cached
+lookup) per request; 2,100 → 13,900 → 23,800 req/s through the proxy on one
+CPU. What remains is Pingora's own HTTP handling plus the access log line.
