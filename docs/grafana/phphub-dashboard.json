@@ -1,0 +1,1050 @@
+{
+ "uid": "phphub",
+ "title": "PHPHub",
+ "tags": [
+  "phphub",
+  "basehub"
+ ],
+ "timezone": "browser",
+ "refresh": "1m",
+ "time": {
+  "from": "now-6h",
+  "to": "now"
+ },
+ "schemaVersion": 39,
+ "editable": true,
+ "description": "所有 PHPHub 进程（BaseHub 统一发现里填了 metrics_port 的 PHP 进程）。新应用自动出现在 app 下拉里。源文件：phphub-server/docs/grafana/phphub-dashboard.json",
+ "templating": {
+  "list": [
+   {
+    "name": "ds",
+    "label": "数据源",
+    "type": "datasource",
+    "query": "prometheus",
+    "current": {}
+   },
+   {
+    "name": "job",
+    "label": "机器",
+    "type": "query",
+    "datasource": {
+     "type": "prometheus",
+     "uid": "${ds}"
+    },
+    "query": {
+     "query": "label_values(phphub_total_threads, job)",
+     "refId": "V"
+    },
+    "definition": "label_values(phphub_total_threads, job)",
+    "refresh": 2,
+    "includeAll": true,
+    "multi": true,
+    "allValue": ".*",
+    "current": {
+     "text": "All",
+     "value": "$__all"
+    },
+    "sort": 1
+   },
+   {
+    "name": "app",
+    "label": "应用",
+    "type": "query",
+    "datasource": {
+     "type": "prometheus",
+     "uid": "${ds}"
+    },
+    "query": {
+     "query": "label_values(phphub_total_threads{job=~\"$job\"}, app)",
+     "refId": "V"
+    },
+    "definition": "label_values(phphub_total_threads{job=~\"$job\"}, app)",
+    "refresh": 2,
+    "includeAll": true,
+    "multi": true,
+    "allValue": ".*",
+    "current": {
+     "text": "All",
+     "value": "$__all"
+    },
+    "sort": 1
+   },
+   {
+    "name": "process",
+    "label": "进程",
+    "type": "query",
+    "datasource": {
+     "type": "prometheus",
+     "uid": "${ds}"
+    },
+    "query": {
+     "query": "label_values(phphub_total_threads{job=~\"$job\",app=~\"$app\"}, process)",
+     "refId": "V"
+    },
+    "definition": "label_values(phphub_total_threads{job=~\"$job\",app=~\"$app\"}, process)",
+    "refresh": 2,
+    "includeAll": true,
+    "multi": true,
+    "allValue": ".*",
+    "current": {
+     "text": "All",
+     "value": "$__all"
+    },
+    "sort": 1
+   },
+   {
+    "name": "window",
+    "label": "窗口",
+    "type": "custom",
+    "query": "2m,5m,15m,1h",
+    "current": {
+     "text": "5m",
+     "value": "5m"
+    },
+    "options": [
+     {
+      "text": "2m",
+      "value": "2m",
+      "selected": false
+     },
+     {
+      "text": "5m",
+      "value": "5m",
+      "selected": true
+     },
+     {
+      "text": "15m",
+      "value": "15m",
+      "selected": false
+     },
+     {
+      "text": "1h",
+      "value": "1h",
+      "selected": false
+     }
+    ]
+   }
+  ]
+ },
+ "panels": [
+  {
+   "id": 1,
+   "type": "row",
+   "title": "概览",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 2,
+   "type": "stat",
+   "title": "请求/秒",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds}"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 1,
+    "w": 6,
+    "h": 4
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum(rate(phphub_request_duration_seconds_count{job=~\"$job\",app=~\"$app\",process=~\"$process\"}[$window]))",
+     "legendFormat": "req/s",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds}"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps"
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "textMode": "value_and_name"
+   }
+  },
+  {
+   "id": 3,
+   "type": "stat",
+   "title": "p95 耗时",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds}"
+   },
+   "gridPos": {
+    "x": 6,
+    "y": 1,
+    "w": 6,
+    "h": 4
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "histogram_quantile(0.95, sum by (le) (rate(phphub_request_duration_seconds_bucket{job=~\"$job\",app=~\"$app\",process=~\"$process\"}[$window])))",
+     "legendFormat": "p95",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds}"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "textMode": "value_and_name"
+   }
+  },
+  {
+   "id": 4,
+   "type": "stat",
+   "title": "5xx/秒",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds}"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 1,
+    "w": 6,
+    "h": 4
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum(rate(phphub_http_requests{job=~\"$job\",app=~\"$app\",process=~\"$process\",status=~\"5..\"}[$window])) or vector(0)",
+     "legendFormat": "5xx",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds}"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "red",
+        "value": 0.01
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "textMode": "value_and_name"
+   }
+  },
+  {
+   "id": 5,
+   "type": "stat",
+   "title": "线程占用",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds}"
+   },
+   "gridPos": {
+    "x": 18,
+    "y": 1,
+    "w": 6,
+    "h": 4
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum(phphub_busy_threads{job=~\"$job\",app=~\"$app\",process=~\"$process\"}) / sum(phphub_total_threads{job=~\"$job\",app=~\"$app\",process=~\"$process\"})",
+     "legendFormat": "busy",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds}"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "max": 1,
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "orange",
+        "value": 0.6
+       },
+       {
+        "color": "red",
+        "value": 0.85
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "textMode": "value_and_name"
+   }
+  },
+  {
+   "id": 6,
+   "type": "row",
+   "title": "耗时",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 5,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 7,
+   "type": "timeseries",
+   "title": "耗时分位数（到达→结束，含排队）",
+   "description": "phphub_request_duration_seconds。桶 5ms–10s，超过 10s 的只能看出 >10s。",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds}"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 6,
+    "w": 12,
+    "h": 9
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "histogram_quantile(0.5, sum by (app, process, le) (rate(phphub_request_duration_seconds_bucket{job=~\"$job\",app=~\"$app\",process=~\"$process\"}[$window])))",
+     "legendFormat": "p50 {{app}}/{{process}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds}"
+     }
+    },
+    {
+     "refId": "B",
+     "expr": "histogram_quantile(0.95, sum by (app, process, le) (rate(phphub_request_duration_seconds_bucket{job=~\"$job\",app=~\"$app\",process=~\"$process\"}[$window])))",
+     "legendFormat": "p95 {{app}}/{{process}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds}"
+     }
+    },
+    {
+     "refId": "C",
+     "expr": "histogram_quantile(0.99, sum by (app, process, le) (rate(phphub_request_duration_seconds_bucket{job=~\"$job\",app=~\"$app\",process=~\"$process\"}[$window])))",
+     "legendFormat": "p99 {{app}}/{{process}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds}"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 8,
+      "showPoints": "never"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "mean",
+      "max",
+      "lastNotNull"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 8,
+   "type": "timeseries",
+   "title": "平均耗时：PHP 与排队",
+   "description": "排队是请求等空闲 PHP 线程的时间。持续 >0 说明线程不够（WORKERS）。",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds}"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 6,
+    "w": 12,
+    "h": 9
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum by (app, process) (rate(phphub_worker_request_time_seconds{job=~\"$job\",app=~\"$app\",process=~\"$process\"}[$window])) / sum by (app, process) (rate(phphub_worker_request_count{job=~\"$job\",app=~\"$app\",process=~\"$process\"}[$window]))",
+     "legendFormat": "PHP {{app}}/{{process}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds}"
+     }
+    },
+    {
+     "refId": "B",
+     "expr": "sum by (app, process) (rate(phphub_worker_queue_time_seconds{job=~\"$job\",app=~\"$app\",process=~\"$process\"}[$window])) / sum by (app, process) (rate(phphub_worker_request_count{job=~\"$job\",app=~\"$app\",process=~\"$process\"}[$window]))",
+     "legendFormat": "排队 {{app}}/{{process}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds}"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 8,
+      "showPoints": "never"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "mean",
+      "max",
+      "lastNotNull"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 9,
+   "type": "heatmap",
+   "title": "耗时分布",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds}"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 15,
+    "w": 24,
+    "h": 8
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum by (le) (increase(phphub_request_duration_seconds_bucket{job=~\"$job\",app=~\"$app\",process=~\"$process\"}[$window]))",
+     "legendFormat": "{{le}}",
+     "format": "heatmap",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds}"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "calculate": false,
+    "yAxis": {
+     "unit": "s"
+    },
+    "cellGap": 1,
+    "color": {
+     "scheme": "Oranges",
+     "mode": "scheme"
+    },
+    "tooltip": {
+     "show": true,
+     "yHistogram": true
+    }
+   }
+  },
+  {
+   "id": 10,
+   "type": "row",
+   "title": "流量与错误",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 23,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 11,
+   "type": "timeseries",
+   "title": "请求/秒",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds}"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 24,
+    "w": 8,
+    "h": 8
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum by (app, process) (rate(phphub_request_duration_seconds_count{job=~\"$job\",app=~\"$app\",process=~\"$process\"}[$window]))",
+     "legendFormat": "{{app}}/{{process}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds}"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 8,
+      "showPoints": "never"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "mean",
+      "max",
+      "lastNotNull"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 12,
+   "type": "timeseries",
+   "title": "按状态码",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds}"
+   },
+   "gridPos": {
+    "x": 8,
+    "y": 24,
+    "w": 8,
+    "h": 8
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum by (status) (rate(phphub_http_requests{job=~\"$job\",app=~\"$app\",process=~\"$process\"}[$window]))",
+     "legendFormat": "{{status}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds}"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 8,
+      "showPoints": "never"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "mean",
+      "max",
+      "lastNotNull"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 13,
+   "type": "timeseries",
+   "title": "5xx 占比",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds}"
+   },
+   "gridPos": {
+    "x": 16,
+    "y": 24,
+    "w": 8,
+    "h": 8
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "(sum by (app, process) (rate(phphub_http_requests{job=~\"$job\",app=~\"$app\",process=~\"$process\",status=~\"5..\"}[$window])) / sum by (app, process) (rate(phphub_http_requests{job=~\"$job\",app=~\"$app\",process=~\"$process\"}[$window]))) or (sum by (app, process) (rate(phphub_http_requests{job=~\"$job\",app=~\"$app\",process=~\"$process\"}[$window])) * 0)",
+     "legendFormat": "{{app}}/{{process}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds}"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 8,
+      "showPoints": "never"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "mean",
+      "max",
+      "lastNotNull"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 14,
+   "type": "row",
+   "title": "线程",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 32,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 15,
+   "type": "timeseries",
+   "title": "PHP 线程",
+   "description": "按抓取时刻采样（60s 一次），忙线程只是瞬时值。",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds}"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 33,
+    "w": 8,
+    "h": 8
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum by (app, process) (phphub_busy_threads{job=~\"$job\",app=~\"$app\",process=~\"$process\"})",
+     "legendFormat": "忙 {{app}}/{{process}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds}"
+     }
+    },
+    {
+     "refId": "B",
+     "expr": "sum by (app, process) (phphub_total_threads{job=~\"$job\",app=~\"$app\",process=~\"$process\"})",
+     "legendFormat": "总 {{app}}/{{process}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds}"
+     }
+    },
+    {
+     "refId": "C",
+     "expr": "sum by (app, process) (phphub_ready_workers{job=~\"$job\",app=~\"$app\",process=~\"$process\"})",
+     "legendFormat": "就绪 {{app}}/{{process}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds}"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 8,
+      "showPoints": "never"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "mean",
+      "max",
+      "lastNotNull"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 16,
+   "type": "timeseries",
+   "title": "排队请求数",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds}"
+   },
+   "gridPos": {
+    "x": 8,
+    "y": 33,
+    "w": 8,
+    "h": 8
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum by (app, process) (phphub_queue_depth{job=~\"$job\",app=~\"$app\",process=~\"$process\"})",
+     "legendFormat": "{{app}}/{{process}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds}"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 8,
+      "showPoints": "never"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "mean",
+      "max",
+      "lastNotNull"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 17,
+   "type": "timeseries",
+   "title": "线程重启与崩溃",
+   "description": "计划重启：MAX_REQUESTS 轮换和 SIGUSR2 热重载。崩溃：fatal、超时、worker 循环退出。",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds}"
+   },
+   "gridPos": {
+    "x": 16,
+    "y": 33,
+    "w": 8,
+    "h": 8
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum by (app, process) (increase(phphub_worker_restarts{job=~\"$job\",app=~\"$app\",process=~\"$process\"}[$window]))",
+     "legendFormat": "计划重启 {{app}}/{{process}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds}"
+     }
+    },
+    {
+     "refId": "B",
+     "expr": "sum by (app, process) (increase(phphub_worker_crashes{job=~\"$job\",app=~\"$app\",process=~\"$process\"}[$window]))",
+     "legendFormat": "崩溃 {{app}}/{{process}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds}"
+     }
+    },
+    {
+     "refId": "C",
+     "expr": "sum by (app, process) (increase(phphub_opcache_restarts{job=~\"$job\",app=~\"$app\",process=~\"$process\"}[$window]))",
+     "legendFormat": "opcache 重启 {{app}}/{{process}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds}"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 8,
+      "showPoints": "never"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "mean",
+      "max",
+      "lastNotNull"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 18,
+   "type": "row",
+   "title": "其它",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 41,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 19,
+   "type": "timeseries",
+   "title": "静态文件与拒绝的点文件",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds}"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 42,
+    "w": 12,
+    "h": 7
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum by (app, process) (rate(phphub_static_requests{job=~\"$job\",app=~\"$app\",process=~\"$process\"}[$window]))",
+     "legendFormat": "静态 {{app}}/{{process}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds}"
+     }
+    },
+    {
+     "refId": "B",
+     "expr": "sum by (app, process) (rate(phphub_rejected_dotfiles{job=~\"$job\",app=~\"$app\",process=~\"$process\"}[$window]))",
+     "legendFormat": "点文件 403 {{app}}/{{process}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds}"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 8,
+      "showPoints": "never"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "mean",
+      "max",
+      "lastNotNull"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 20,
+   "type": "timeseries",
+   "title": "抓取状态",
+   "description": "0 表示 Prometheus 抓不到这个进程的 /metrics。",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds}"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 42,
+    "w": 12,
+    "h": 7
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "up{job=~\"$job\",app=~\"$app\",process=~\"$process\"} and on (instance) max_over_time(phphub_total_threads{job=~\"$job\"}[1d])",
+     "legendFormat": "{{job}} {{app}}/{{process}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds}"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 8,
+      "showPoints": "never"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "mean",
+      "max",
+      "lastNotNull"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  }
+ ]
+}

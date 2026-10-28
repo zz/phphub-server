@@ -160,6 +160,14 @@ arrival to finish, queue included (buckets 5ms to 10s), for percentiles:
 histogram_quantile(0.95, sum by (le) (rate(phphub_request_duration_seconds_bucket[5m])))
 ```
 
+Grafana: `docs/grafana/phphub-dashboard.json` (uid `phphub`) covers every PHPHub
+process that Prometheus scrapes with `app` and `process` labels (BaseHub metrics
+discovery adds them), so a new app shows up in its drop-downs without edits.
+prod-monitoring-1 provisions it from
+`/home/ubuntu/docker/grafana-dashboards/provisioned/phphub.json` (folder
+BaseHub, read-only in the UI): change the file here, copy it there, and Grafana
+picks it up within a minute.
+
 `phphub_worker_crashes` counts fatal errors, uncaught exceptions, timeouts
 and a worker loop that ends. `exit()` and `die()` in index, file or classic
 mode end the request normally and are not counted.
