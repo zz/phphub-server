@@ -73,7 +73,7 @@ while (phphub_handle_request()) {
 
 `$_FILES` 的临时文件在 `phphub_finish_request()` 时删掉。上传大小受 `BODY_LIMIT` 限制，默认 32m。
 
-部署新代码不用重启容器：`docker kill -s USR2 <容器>`。监听端口不关，每条线程做完手上的请求后重启自己的 PHP（空闲的立即重启），同一时刻最多四分之一的线程在重启，其余线程照常接请求，新请求在队列里等，不会被拒。重载期间再发信号会合并成一次。依赖 `opcache.validate_timestamps=1`；同步完文件后要等过 `opcache.revalidate_freq` 秒再发信号。`index`、`file` 模式下只记一条日志。
+部署新代码不用重启容器：`docker exec <容器> sh -c 'kill -USR2 1'`。不要用 `docker kill -s USR2`：Docker 给容器发过任何信号，都会把它记成“手动停止”，这个标记在容器运行期间一直保留，之后进程哪怕是崩溃退出，`unless-stopped` 也不再拉起。监听端口不关，每条线程做完手上的请求后重启自己的 PHP（空闲的立即重启），同一时刻最多四分之一的线程在重启，其余线程照常接请求，新请求在队列里等，不会被拒。重载期间再发信号会合并成一次。依赖 `opcache.validate_timestamps=1`；同步完文件后要等过 `opcache.revalidate_freq` 秒再发信号。`index`、`file` 模式下只记一条日志。
 
 worker 循环里，一条线程处理满 `MAX_REQUESTS`（默认 1000）之后，只重启这一条线程上的 PHP，其它线程继续接请求。线程 `i` 的上限是 `MAX_REQUESTS + i`。`0` 表示不重启。这是为了拦住慢慢涨的内存，不是退回每个请求启动一次。`index` 和 `file` 会读到这个环境变量，但每个请求单独跑完，不按它回收。`PHP_TIMEOUT` 三种模式都生效。
 

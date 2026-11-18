@@ -130,8 +130,11 @@ Fixed behaviour:
   `reload N done in Xs`; each counts in `phphub_worker_restarts`. Signals sent
   while one runs merge into it. Needs `opcache.validate_timestamps=1`: after
   deploying files, wait longer than `opcache.revalidate_freq` before
-  `docker kill -s USR2 <container>`. In `index`/`file` mode it only logs, since
-  every request already runs the current files.
+  `docker exec <container> sh -c 'kill -USR2 1'`. In `index`/`file` mode it
+  only logs, since every request already runs the current files.
+  Do not use `docker kill -s USR2`: Docker marks a container it sent any
+  signal to as manually stopped and keeps the mark while it runs, so the next
+  exit, even a crash, is not restarted under `unless-stopped`.
 - As PID 1 (no `docker run --init`), PHPHub forks once at start, as tini
   does. PID 1 forwards signals to the child and reaps every process that
   exits, including orphans such as a `timeout` left behind by `exec()`. The
