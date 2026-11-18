@@ -103,6 +103,18 @@ Fixed behaviour:
   [docs/requests.md](docs/requests.md).
 - `display_errors=Off`, `log_errors=On`. Opcache on with
   `validate_timestamps=1` and `revalidate_freq=2` (conf.d may change these).
+- Opcache restarts. A restart (`opcache_reset()`, a full cache or hash
+  table) runs in the next PHP startup and frees the shared memory every
+  thread's scripts run from; PHP 8.5's check for other users cannot see
+  threads of the same process, so a thread restart after a deploy aborted
+  the whole process with `zend_mm_heap corrupted`. PHPHub drains instead:
+  every thread leaves PHP after its current request, new requests wait in
+  the queue, and the first thread to start again resets the cache (logs
+  `opcache restart scheduled` and `opcache drain done in Xs`; a request
+  still running after 10 seconds, or `PHP_TIMEOUT` if shorter, is aborted).
+  In worker mode with `validate_timestamps` on, `opcache_reset()` does not
+  reset the cache at all: it starts a `SIGUSR2`-style reload, which loads
+  changed files by itself.
 - After conf.d is scanned, the SAPI always sets `expose_php=0`,
   `display_errors` and `display_startup_errors` from `DISPLAY_ERRORS`,
   `zlib.output_compression=0`, and both `post_max_size` and

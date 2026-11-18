@@ -605,6 +605,33 @@ static void build_env_snapshot(void) {
 
 static void hub_opcache_hook(int reason) { phphub_rs_opcache_restart(reason); }
 
+static zif_handler orig_opcache_reset = NULL;
+
+/* opcache_reset() makes the next startup free the shared memory every
+ * thread's scripts run from. Deploys call it to load new code, but with
+ * opcache.validate_timestamps on, a worker-mode reload does that by itself:
+ * each thread restarts its PHP and recompiles the files that changed. So it
+ * reloads instead and the cache is never reset. Otherwise the real reset
+ * runs, behind the drain in phphub_rs_opcache_restart(). */
+static ZEND_NAMED_FUNCTION(hub_opcache_reset) {
+  if (INI_BOOL("opcache.validate_timestamps") &&
+      phphub_rs_reload_for_opcache_reset()) {
+    ZEND_PARSE_PARAMETERS_NONE();
+    RETURN_TRUE;
+  }
+  orig_opcache_reset(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
+
+/* Threads copy the internal functions when they start, so this runs before. */
+static void hub_wrap_opcache_reset(void) {
+  zend_function *fn =
+      zend_hash_str_find_ptr(CG(function_table), ZEND_STRL("opcache_reset"));
+  if (fn && fn->type == ZEND_INTERNAL_FUNCTION) {
+    orig_opcache_reset = fn->internal_function.handler;
+    fn->internal_function.handler = hub_opcache_reset;
+  }
+}
+
 static void hub_interrupt(zend_execute_data *ed) {
   hub_ctx *c = tctx;
   if (c) {
@@ -647,6 +674,7 @@ int phphub_php_startup(int threads, const char *ini_entries,
   }
 
   zend_accel_schedule_restart_hook = hub_opcache_hook;
+  hub_wrap_opcache_reset();
   prev_interrupt = zend_interrupt_function;
   zend_interrupt_function = hub_interrupt;
 
@@ -713,8 +741,17 @@ int phphub_run(void *ctx, const hub_request *req, int once) {
   c->live = req != NULL;
   hub_attach(c, req);
 
+  /* A pending opcache restart runs inside php_request_startup() and frees
+   * the shared memory other threads' scripts run from; PHP 8.5's ZTS check
+   * for other users cannot see threads of this process. Rust lets a thread
+   * start only when no other one runs PHP while a restart is pending. */
+  volatile int starting = 1;
+  phphub_rs_startup_begin(c->rs);
   zend_first_try {
-    if (php_request_startup() == FAILURE) {
+    int started = php_request_startup();
+    starting = 0;
+    phphub_rs_startup_end(c->rs);
+    if (started == FAILURE) {
       flags |= HUB_RUN_FATAL;
     } else {
       zend_file_handle fh;
@@ -733,6 +770,10 @@ int phphub_run(void *ctx, const hub_request *req, int once) {
   }
   zend_catch { flags |= HUB_RUN_FATAL; }
   zend_end_try();
+  if (starting) {
+    /* php_request_startup() bailed out. */
+    phphub_rs_startup_end(c->rs);
+  }
 
   /* A bailout inside a session save handler leaves this set and blocks the
    * handler's close() in RSHUTDOWN. */

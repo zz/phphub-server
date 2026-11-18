@@ -5,8 +5,8 @@ pub mod job;
 
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering::*};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender, select};
@@ -35,7 +35,17 @@ enum Ctrl {
     ModeChanged,
     /// A reload is pending: restart this thread's PHP if it is stale.
     Reload,
+    /// An opcache restart is pending: leave PHP after the current request.
+    Drain,
 }
+
+/// The pool, for C callbacks that have no thread state (the opcache hook).
+static POOL: OnceLock<&'static Pool> = OnceLock::new();
+
+/// How long an opcache drain waits for running requests before it aborts
+/// them. Every other thread is waiting meanwhile, so it is short; PHP_TIMEOUT
+/// caps it when that is shorter.
+const DRAIN_GRACE: Duration = Duration::from_secs(10);
 
 pub struct ThreadShared {
     idx: usize,
@@ -69,6 +79,36 @@ pub struct Pool {
     /// Threads restarting for a reload right now (at most reload_cap()).
     reloading: AtomicUsize,
     reload_started: Mutex<Option<Instant>>,
+    /// An opcache restart is scheduled. The restart itself runs in the next
+    /// php_request_startup() of any thread and frees the shared memory every
+    /// other thread's scripts run from; PHP 8.5's ZTS check for other users
+    /// (an fcntl lock) cannot see threads of the same process. So while this
+    /// is set, no thread starts PHP until no thread is inside PHP.
+    drain: AtomicBool,
+    drain_started: Mutex<Option<Instant>>,
+    /// Which threads run PHP now; see startup_begin().
+    gate: Mutex<Gate>,
+    gate_cv: Condvar,
+}
+
+/// PHP runs past the opcache gate.
+#[derive(Default)]
+struct Gate {
+    /// Threads between startup_begin() and the end of their phphub_run().
+    in_php: usize,
+    /// Of those, the ones still inside php_request_startup().
+    starting: usize,
+    /// The thread that ended a drain is in php_request_startup(), resetting
+    /// the cache. Nobody else starts until it is done: other modules' RINIT
+    /// read opcache's interned strings without its lock.
+    resetting: bool,
+}
+
+thread_local! {
+    /// This thread is inside php_request_startup().
+    static STARTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// This thread ended a drain and its startup resets the cache.
+    static RESETTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl Pool {
@@ -117,6 +157,10 @@ impl Pool {
             reload_gen: AtomicU64::new(0),
             reloading: AtomicUsize::new(0),
             reload_started: Mutex::new(None),
+            drain: AtomicBool::new(false),
+            drain_started: Mutex::new(None),
+            gate: Mutex::new(Gate::default()),
+            gate_cv: Condvar::new(),
         }
     }
 
@@ -135,6 +179,7 @@ impl Pool {
         if rc != 0 {
             return Err("PHP failed to start".into());
         }
+        let _ = POOL.set(self);
         let entry = &self.cfg.worker_script;
         match (self.cfg.mode, self.mode()) {
             (RunMode::Worker, _) => logln!("PHPHUB_MODE=worker: {entry} boots once per thread"),
@@ -265,6 +310,114 @@ impl Pool {
         if let Some(t0) = self.reload_started.lock().unwrap().take() {
             logln!("reload {} done in {:.3}s", self.reload_gen.load(Acquire), t0.elapsed().as_secs_f64());
         }
+    }
+
+    /// opcache is about to schedule a restart (opcache_reset(), a full cache
+    /// or hash table); it sets restart_pending once this returns. Called on
+    /// the PHP thread that triggered it, usually under the opcache lock.
+    /// Every thread leaves PHP after its current request, and the next
+    /// startup after that resets the cache.
+    ///
+    /// A thread already inside php_request_startup() passed the gate before
+    /// the drain and would perform the restart while others still run, so
+    /// this waits for those startups first. They cannot need the opcache
+    /// lock: opcache calls this only while no restart is pending, and
+    /// accel_activate() locks only for a pending one.
+    fn opcache_restart_scheduled(&'static self, reason: c_int) {
+        if !self.drain.swap(true, AcqRel) {
+            self.start_drain(reason);
+        }
+        let me = STARTING.with(|s| s.get()) as usize;
+        let mut g = self.gate.lock().unwrap();
+        while g.starting > me {
+            g = self.gate_cv.wait(g).unwrap();
+        }
+    }
+
+    fn start_drain(&'static self, reason: c_int) {
+        *self.drain_started.lock().unwrap() = Some(Instant::now());
+        let why = match reason {
+            0 => "out of memory",
+            1 => "hash table full",
+            _ => "opcache_reset()",
+        };
+        logln!(
+            "opcache restart scheduled ({why}): draining {} PHP threads so the cache resets while none runs PHP",
+            self.threads.len()
+        );
+        for t in &self.threads {
+            let _ = t.ctrl_tx.send(Ctrl::Drain);
+        }
+        let grace = DRAIN_GRACE.min(self.cfg.php_timeout);
+        let spawned = std::thread::Builder::new().name("phphub-drain".into()).spawn(move || {
+            std::thread::sleep(grace);
+            self.kick_drain_stragglers(grace);
+        });
+        if let Err(e) = spawned {
+            logln!("opcache drain: cannot start the grace timer: {e}");
+        }
+    }
+
+    /// The drain is still waiting after `grace`: abort the requests that hold it.
+    fn kick_drain_stragglers(&self, grace: Duration) {
+        if !self.drain.load(Acquire) {
+            return;
+        }
+        for t in &self.threads {
+            let seq = t.cur_seq.load(Acquire);
+            if seq == 0 {
+                continue;
+            }
+            logln!("opcache drain: thread {} still busy after {:.0}s; aborting its request", t.idx, grace.as_secs_f64());
+            t.kicked_seq.store(seq, Release);
+            let g = t.ctx.lock().unwrap();
+            if *g != 0 {
+                unsafe { ffi::phphub_kick(*g as *mut c_void, seq) };
+            }
+        }
+    }
+
+    /// Right before php_request_startup(), the only place an opcache restart
+    /// runs. While a drain is pending, wait until no thread runs PHP; the
+    /// first thread through ends the drain and starts alone, so its startup
+    /// resets the cache with nobody else in PHP; the rest follow once it is
+    /// done. Waiting threads are not counted, so they cannot hold the drain up.
+    fn startup_begin(&self) {
+        let mut g = self.gate.lock().unwrap();
+        while (g.in_php > 0 && self.drain.load(Acquire)) || g.resetting {
+            g = self.gate_cv.wait(g).unwrap();
+        }
+        if self.drain.swap(false, AcqRel) {
+            let took = self.drain_started.lock().unwrap().take().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+            logln!("opcache drain done in {took:.3}s: no thread runs PHP, the cache resets now");
+            g.resetting = true;
+            RESETTING.with(|r| r.set(true));
+        }
+        g.in_php += 1;
+        g.starting += 1;
+        STARTING.with(|s| s.set(true));
+    }
+
+    /// php_request_startup() returned (or bailed out).
+    fn startup_end(&self) {
+        STARTING.with(|s| s.set(false));
+        let mut g = self.gate.lock().unwrap();
+        g.starting -= 1;
+        if RESETTING.with(|r| r.replace(false)) {
+            g.resetting = false;
+        }
+        self.gate_cv.notify_all();
+    }
+
+    /// phphub_run() returned. Only after startup_begin(), which every run calls first.
+    fn leave_php(&self) {
+        let mut g = self.gate.lock().unwrap();
+        g.in_php -= 1;
+        self.gate_cv.notify_all();
+    }
+
+    fn draining(&self) -> bool {
+        self.drain.load(Acquire)
     }
 
     pub fn shutdown(&self) {
@@ -483,6 +636,8 @@ enum NextNull {
     Shutdown,
     Restart,
     Reload,
+    /// Left PHP for an opcache restart.
+    Drain,
 }
 
 /// Owned by one PHP thread; C gets a pointer to it.
@@ -522,6 +677,8 @@ enum Wait {
     ModeChanged,
     /// Stale after a reload, and a reload slot is now held.
     Reload,
+    /// An opcache restart is pending.
+    Drain,
 }
 
 impl ThreadState {
@@ -547,6 +704,12 @@ impl ThreadState {
                     Ok(Ctrl::Reload) => {
                         if in_worker && self.take_reload_slot() {
                             return Wait::Reload;
+                        }
+                    }
+                    // Outside PHP there is nothing to leave; startup_begin() waits.
+                    Ok(Ctrl::Drain) => {
+                        if in_worker && self.pool.draining() {
+                            return Wait::Drain;
                         }
                     }
                 },
@@ -672,6 +835,13 @@ impl ThreadState {
                         self.run_requests
                     );
                 }
+                NextNull::Drain => {
+                    METRICS.worker.restarts.fetch_add(1, Relaxed);
+                    logln!(
+                        "thread {idx} left PHP for the opcache restart after {} requests script={script} uptime={uptime:.1}s",
+                        self.run_requests
+                    );
+                }
                 NextNull::Restart => {
                     METRICS.worker.restarts.fetch_add(1, Relaxed);
                     logln!(
@@ -784,8 +954,8 @@ fn thread_main(pool: &'static Pool, shared: Arc<ThreadShared>) {
             match st.wait(false) {
                 Wait::Job(j) => Some(j),
                 Wait::Shutdown => break,
-                // wait(false) does not take reload slots; nothing to do here.
-                Wait::ModeChanged | Wait::Reload => continue,
+                // wait(false) takes no reload slot and has no PHP to leave.
+                Wait::ModeChanged | Wait::Reload | Wait::Drain => continue,
             }
         };
 
@@ -798,7 +968,9 @@ fn thread_main(pool: &'static Pool, shared: Arc<ThreadShared>) {
             Some(j) => st.activate(j),
             None => std::ptr::null(),
         };
+        // phphub_run() waits in phphub_rs_startup_begin() while an opcache drain runs.
         let flags = unsafe { ffi::phphub_run(ctx, creq, once as c_int) };
+        pool.leave_php();
         let st = unsafe { &mut *st_ptr };
         st.end_run(flags, had_job);
         st.retired = None;
@@ -841,6 +1013,12 @@ pub extern "C" fn phphub_rs_next(rs: *mut c_void) -> *const ffi::HubRequest {
         let a = st.current.insert(a);
         return &*a.job.creq;
     }
+    // Before the request limit: a thread that leaves for both must not start
+    // PHP again until the drain is over, and only Drain says so in the log.
+    if st.pool.draining() {
+        st.next_null = NextNull::Drain;
+        return std::ptr::null();
+    }
     if st.request_limit().is_some_and(|limit| st.run_requests >= limit) {
         st.next_null = NextNull::Restart;
         return std::ptr::null();
@@ -858,6 +1036,10 @@ pub extern "C" fn phphub_rs_next(rs: *mut c_void) -> *const ffi::HubRequest {
         Wait::Job(j) => st.activate(j),
         Wait::Reload => {
             st.next_null = NextNull::Reload;
+            std::ptr::null()
+        }
+        Wait::Drain => {
+            st.next_null = NextNull::Drain;
             std::ptr::null()
         }
         _ => {
@@ -942,9 +1124,35 @@ pub extern "C" fn phphub_rs_log(msg: *const c_char, len: usize) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn phphub_rs_startup_begin(rs: *mut c_void) {
+    let st = unsafe { state(rs) };
+    st.pool.startup_begin();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn phphub_rs_startup_end(rs: *mut c_void) {
+    let st = unsafe { state(rs) };
+    st.pool.startup_end();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn phphub_rs_reload_for_opcache_reset() -> c_int {
+    let Some(pool) = POOL.get() else { return 0 };
+    if pool.cfg.mode != RunMode::Worker && pool.mode() != Mode::Worker {
+        return 0;
+    }
+    logln!("opcache_reset(): reloading the PHP threads instead of resetting the shared cache");
+    pool.reload();
+    1
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn phphub_rs_opcache_restart(reason: c_int) {
     if let Some(c) = METRICS.opcache_restarts.get(reason as usize) {
         c.fetch_add(1, Relaxed);
+    }
+    if let Some(pool) = POOL.get() {
+        pool.opcache_restart_scheduled(reason);
     }
 }
 

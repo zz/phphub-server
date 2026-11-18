@@ -108,6 +108,8 @@ PHP 的报错不写进响应。`display_errors=Off`，`log_errors=On`。`DISPLAY
 
 opcache 打开。`validate_timestamps=1`，`revalidate_freq=2`，这样 BaseHub 同步文件之后不用重建容器。确认要更少的 stat 时再关，关了就要等线程重启才看得到新代码。
 
+opcache 重启（`opcache_reset()`、共享内存或哈希表满）在下一次 PHP 启动里执行，会释放所有线程的脚本正在用的共享内存。PHP 8.5 判断“还有没有别人在用”靠 fcntl 锁，看不到同一进程里的其它线程，所以以前部署后某条线程一重启，整个进程就 `zend_mm_heap corrupted` 退出（2026-11-17 prod-vu-1、prod-he-10）。现在 PHPHub 先排空：每条线程做完手上的请求就退出 PHP，新请求在队列里等，最后一条退出后，第一条重新启动的线程完成重置。日志是 `opcache restart scheduled` 和 `opcache drain done in Xs`，通常零点几秒；10 秒（`PHP_TIMEOUT` 更短就用它）后还在跑的请求会被中止。worker 模式下且 `validate_timestamps` 打开时，`opcache_reset()` 根本不重置缓存，而是触发一次和 `SIGUSR2` 一样的重载，改过的文件会按时间戳重新编译。
+
 ## 镜像
 
 运行镜像里要有 ZTS 的 libphp、和 `images/frankenphp` 同一套扩展（Phalcon 5.23、redis、memcached、yaml、apcu），以及静态链接的 `phphub`。不要把 Caddy 带进来，也不要 `FROM dunglas/frankenphp` 之后只是换掉 Caddyfile。

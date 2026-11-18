@@ -50,6 +50,13 @@ extern void phphub_rs_flush(void *rs);
 extern void phphub_rs_finish(void *rs, int crashed);
 extern void phphub_rs_log(const char *msg, size_t len);
 extern void phphub_rs_opcache_restart(int reason);
+/* Around php_request_startup(), where a pending opcache restart runs: begin
+ * waits while an opcache drain still has threads inside PHP. */
+extern void phphub_rs_startup_begin(void *rs);
+extern void phphub_rs_startup_end(void *rs);
+/* opcache_reset() in worker mode: starts a reload and returns 1, or returns
+ * 0 when there is no worker loop to reload. */
+extern int phphub_rs_reload_for_opcache_reset(void);
 
 /* Provided by C, called from Rust. */
 int phphub_php_startup(int threads, const char *ini_entries,
